@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Adapted from ROCm/aiter#6173 at c39b56c36 (Apache-2.0 License),
+# Adapted from vllm-project/vllm at ca328e297b (Apache-2.0):
+# vllm/models/glm5next/amd/ops/mono/ops.py, itself adapted from
+# ROCm/aiter#6173 at c39b56c36 (Apache-2.0 License),
 # Copyright (c) 2025 FlyDSL Project Contributors:
 # aiter/ops/flydsl/kernels/glm5_mono/ops.py
 
@@ -95,7 +97,7 @@ def exp(value):
 
 
 def xshfl(value, offset):
-    """Return the value from ``lane ^ offset`` using VALU/DPP operations."""
+    """Return the value from ``lane ^ offset`` using vector ALU / DPP operations."""
     if offset >= 16:
         return value.shuffle_xor(offset, 64)
     is_float = isinstance(value, fx.Float32)
