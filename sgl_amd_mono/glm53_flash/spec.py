@@ -319,13 +319,13 @@ class _Built:
         pp_proxy_tensors=None,
     ):
         """``Glm5NextForConditionalGeneration.forward`` for a routed decode step."""
-        from sglang.srt.layers.layer_boundary import get_attn_tp_context
-
         lm = self.lm
         if plan.key.rows > self.max_rows:
             return type(lm).forward(
                 lm, input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
+        from sglang.srt.layers.layer_boundary import get_attn_tp_context
+
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden = self._backbone(
                 plan, input_ids, positions, forward_batch, input_embeds
