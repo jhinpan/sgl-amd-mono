@@ -1,267 +1,302 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2026 FlyDSL Project Contributors
-
-"""Shared host-side weight container for model-specific MonoKernels."""
+"""GLM-5.3's layer tensors as the kernel reads them, from SGLang's loaded modules
+(``Glm53Weights``). Projections and experts are SGLang's FP8 tensors in place;
+W_UK and W_UV, the router, the indexer's weights_proj and its k LayerNorm are
+copies, recorded in ``copies`` for the startup log."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from typing import Optional
 
 import torch
 
-from aiter.ops.flydsl.kernels.glm5_mono.config import (
-    GLM5_CONFIG,
-    LayerConfig,
-    Mxfp4ScaleLayout,
-    Mxfp4WeightLayout,
-)
-from aiter.ops.flydsl.kernels.glm5_mono.dispatch import MonoUnsupported
+from .config import GLM5_GLOBAL_HEADS, HIDDEN, KV_LORA, NOPE_DIM, PE_DIM, Q_LORA, V_DIM
+from .layout import INDEX_DIM, INDEX_HEADS
+from .packing import pack_bf16, pack_fp8
+
+# The SGLang names this module reads (test/unit/test_contract.py pins them)
+SGLANG_READS = {
+    "srt/models/deepseek_v2.py": (
+        "self_attn",
+        "mlp",
+        "input_layernorm",
+        "post_attention_layernorm",
+        "fused_qkv_a_proj_with_mqa",
+        "q_a_layernorm",
+        "kv_a_layernorm",
+        "q_b_proj",
+        "o_proj",
+        "w_kc",
+        "w_vc",
+        "w_scale",
+        "indexer",
+        "rotary_emb",
+        "gate",
+        "e_score_correction_bias",
+        "experts",
+    ),
+    "srt/layers/attention/dsa/dsa_indexer.py": (
+        "wq_b",
+        "wk",
+        "weights_proj",
+        "k_norm",
+        "rotary_emb",
+    ),
+    "srt/layers/rotary_embedding/base.py": ("cos_sin_cache",),
+    "srt/layers/quantization/fp8.py": (
+        "weight_scale_inv",
+        "aiter_bpreshuffled",
+        "is_shuffled",
+        "w13_weight",
+        "w13_weight_scale_inv",
+        "w2_weight",
+        "w2_weight_scale_inv",
+    ),
+}
+
+N_EXPERTS = 256
+# SGLang appends the shared expert to the routed ones
+PHYSICAL_EXPERTS = N_EXPERTS + 1
+QKV_A = Q_LORA + KV_LORA + PE_DIM
 
 
-def _need(ok: bool, what: str) -> None:
-    if not ok:
-        raise MonoUnsupported(what)
+def _cdiv(a: int, b: int) -> int:
+    return -(-a // b)
 
 
-def _unshuffle_linear_weight(weight: torch.Tensor) -> torch.Tensor:
-    """Invert AITER's MI355 16x16 weight preshuffle."""
-
-    if not getattr(weight, "is_shuffled", False):
-        return weight.contiguous()
-    source_dtype = weight.dtype
-    raw = weight if weight.dtype == torch.uint8 else weight.view(torch.uint8)
-    *lead, rows, packed_k = raw.shape
-    lane_k = 16 // raw.element_size()
-    block_k = 32
-    shuffled = raw.reshape(
-        *lead,
-        rows // 16,
-        packed_k // block_k,
-        block_k // lane_k,
-        16,
-        lane_k,
-    )
-    nlead = len(lead)
-    order = list(range(nlead)) + [nlead, nlead + 3, nlead + 1, nlead + 2, nlead + 4]
-    return (
-        shuffled.permute(*order)
-        .contiguous()
-        .reshape(*lead, rows, packed_k)
-        .view(source_dtype)
-    )
-
-
-def _unshuffle_linear_scale(
-    scale: torch.Tensor,
-    *,
-    experts: int,
-    rows: int,
-    groups: int,
-) -> torch.Tensor:
-    """Invert the non-GUGU E8M0 scale layout used by FlyDSL linears."""
-
-    flat_rows = experts * rows
-    padded_rows = (flat_rows + 255) // 256 * 256
-    padded_groups = (groups + 7) // 8 * 8
-    _need(
-        scale.numel() == padded_rows * padded_groups,
-        f"linear scale bytes {scale.numel()} != {padded_rows * padded_groups}",
-    )
-    packed = scale.reshape(
-        padded_rows // 32,
-        padded_groups // 8,
-        4,
-        16,
-        2,
-        2,
-    )
-    native = packed.permute(0, 5, 3, 1, 4, 2).contiguous()
-    return native.reshape(padded_rows, padded_groups)[:flat_rows, :groups].reshape(
-        experts, rows, groups
-    )
-
-
-@dataclass
-class LayerWeights:
-    """One tensor-parallel rank's weights and model geometry."""
-
-    heads: int
-    t: dict[str, torch.Tensor]
-    config: LayerConfig = GLM5_CONFIG
-    rank: int = 0
-    npes: int = 1
-    mxfp4_weight_layout: Mxfp4WeightLayout = Mxfp4WeightLayout.NATIVE
-    mxfp4_scale_layout: Mxfp4ScaleLayout = Mxfp4ScaleLayout.NATIVE
-    physical_experts: int | None = None
-
-
-def atom_mxfp4_storage_view(
-    tensor: torch.Tensor,
-    *,
-    name: str,
-    logical_rows: int,
-    logical_k: int,
-    scale: bool,
-) -> torch.Tensor:
-    if logical_rows <= 0 or logical_k <= 0 or logical_k % 32:
-        raise ValueError(f"{name} invalid logical shape [{logical_rows}, {logical_k}]")
-    if not tensor.is_contiguous():
-        raise ValueError(f"{name} ATOM storage must be contiguous")
-    if tensor.element_size() != 1:
-        raise ValueError(f"{name} ATOM storage must use one-byte values")
-    if scale:
-        groups = logical_k // 32
-        padded_rows = (logical_rows + 255) // 256 * 256
-        padded_groups = (groups + 7) // 8 * 8
-        expected_bytes = padded_rows * padded_groups
-    else:
-        if not getattr(tensor, "is_shuffled", False):
-            raise ValueError(f"{name} ATOM weight must carry the preshuffled marker")
-        expected_bytes = logical_rows * logical_k // 2
-    if tensor.numel() != expected_bytes:
+def _need(name: str, t: torch.Tensor, shape: tuple, dtypes: tuple) -> torch.Tensor:
+    if tuple(t.shape) != shape or t.dtype not in dtypes or not t.is_contiguous():
         raise ValueError(
-            f"{name} has {tensor.numel()} bytes, expected {expected_bytes}"
+            f"needs {name} as contiguous {'/'.join(map(str, dtypes))} {shape}, got "
+            f"{t.dtype} {tuple(t.shape)} {tuple(t.stride())}"
         )
-    return tensor.view(torch.uint8).view(-1)
+    return t
 
 
-def prepare_mxfp4_expert_storage(
-    weights: LayerWeights, *, canonical: bool = True
-) -> tuple[torch.Tensor, ...]:
-    config = weights.config
-    tensors = weights.t
-    experts = (
-        config.n_experts
-        if weights.physical_experts is None
-        else weights.physical_experts
-    )
-    expert_hidden = (
-        config.hidden if config.routed_hidden is None else config.routed_hidden
-    )
-    ug_rows = 2 * config.inter
-    dn_rows = expert_hidden
-
-    if not canonical:
-        if (
-            weights.mxfp4_weight_layout is not Mxfp4WeightLayout.ATOM
-            or weights.mxfp4_scale_layout is not Mxfp4ScaleLayout.ATOM
-        ):
-            raise ValueError("zero-copy MXFP4 storage requires ATOM values and scales")
-        return (
-            atom_mxfp4_storage_view(
-                tensors["w_ug"],
-                name="w_ug",
-                logical_rows=experts * ug_rows,
-                logical_k=expert_hidden,
-                scale=False,
-            ),
-            atom_mxfp4_storage_view(
-                tensors["s_ug"],
-                name="s_ug",
-                logical_rows=experts * ug_rows,
-                logical_k=expert_hidden,
-                scale=True,
-            ),
-            atom_mxfp4_storage_view(
-                tensors["w_dn"],
-                name="w_dn",
-                logical_rows=experts * dn_rows,
-                logical_k=config.inter,
-                scale=False,
-            ),
-            atom_mxfp4_storage_view(
-                tensors["s_dn"],
-                name="s_dn",
-                logical_rows=experts * dn_rows,
-                logical_k=config.inter,
-                scale=True,
-            ),
-        )
-
-    from aiter.ops.flydsl.kernels.glm5_mono.packing import pack_mxfp4
-
-    def values(name: str, rows: int, k: int) -> torch.Tensor:
-        tensor = tensors[name]
-        if weights.mxfp4_weight_layout is Mxfp4WeightLayout.ATOM:
-            packed = atom_mxfp4_storage_view(
-                tensor, name=name, logical_rows=experts * rows, logical_k=k, scale=False
-            )
-            shuffled = packed.view(experts, rows, k // 2)
-            shuffled.is_shuffled = True
-            tensor = _unshuffle_linear_weight(shuffled)
-        elif weights.mxfp4_weight_layout is not Mxfp4WeightLayout.NATIVE:
-            raise ValueError(
-                f"unsupported MXFP4 weight layout {weights.mxfp4_weight_layout!r}"
-            )
-        return pack_mxfp4(tensor)
-
-    def scales(name: str, rows: int, k: int) -> torch.Tensor:
-        tensor = tensors[name]
-        groups = k // 32
-        if weights.mxfp4_scale_layout is Mxfp4ScaleLayout.ATOM:
-            packed = atom_mxfp4_storage_view(
-                tensor, name=name, logical_rows=experts * rows, logical_k=k, scale=True
-            )
-            tensor = _unshuffle_linear_scale(
-                packed, experts=experts, rows=rows, groups=groups
-            )
-        elif weights.mxfp4_scale_layout is not Mxfp4ScaleLayout.NATIVE:
-            raise ValueError(
-                f"unsupported MXFP4 scale layout {weights.mxfp4_scale_layout!r}"
-            )
-        return tensor.view(torch.uint8).contiguous().view(-1)
-
-    return (
-        values("w_ug", ug_rows, expert_hidden),
-        scales("s_ug", ug_rows, expert_hidden),
-        values("w_dn", dn_rows, config.inter),
-        scales("s_dn", dn_rows, config.inter),
-    )
-
-
-def pack_dense_mlp(
-    gate_up: torch.Tensor,
-    gate_up_scale: torch.Tensor,
-    down: torch.Tensor,
-    down_scale: torch.Tensor,
-    slices: int,
-) -> dict[str, torch.Tensor]:
-    """Store a dense MXFP4 MLP as ``slices`` AITER-shuffled expert slices.
-
-    Inputs are row-major MXFP4 with one E8M0 scale per 32 inputs: ``gate_up``
-    ``[2 * I, K // 2]`` (gate rows, then up rows) and ``down`` ``[N, I // 2]``.
-    Slice ``j`` takes intermediates ``j * I // slices`` onward, so summing the
-    slices' outputs gives the dense MLP. Returns ``w_ug``, ``s_ug``, ``w_dn`` and
-    ``s_dn`` in the ATOM expert layout, ready for ``Glm5MonoKernel(dense_experts=)``.
-    """
-    from aiter.ops.shuffle import shuffle_scale, shuffle_weight
-
-    two_inter, half_k = gate_up.shape
-    inter = two_inter // 2
-    hidden, half_inter = down.shape
-    part = inter // slices
+def _fp8(name: str, weight, scale, rows: int, cols: int):
+    """An FP8 E4M3 [rows, cols] weight with its f32 128 x 128 block scales."""
+    _need(f"{name} weight", weight, (rows, cols), (torch.float8_e4m3fn,))
+    if scale is None:
+        raise ValueError(f"needs {name} as block FP8; it has no weight_scale_inv")
     _need(
-        inter % slices == 0 and part % 32 == 0 and half_inter * 2 == inter,
-        f"dense MLP of {inter} intermediates does not split into {slices} slices",
+        f"{name} scale", scale, (_cdiv(rows, 128), _cdiv(cols, 128)), (torch.float32,)
     )
-    gu = gate_up.view(torch.uint8).view(2, slices, part, half_k).transpose(0, 1)
-    gus = gate_up_scale.view(torch.uint8).view(2, slices, part, -1).transpose(0, 1)
-    dn = down.view(torch.uint8).view(hidden, slices, part // 2).transpose(0, 1)
-    dns = down_scale.view(torch.uint8).view(hidden, slices, part // 32).transpose(0, 1)
-    w_ug = shuffle_weight(gu.reshape(slices, 2 * part, half_k).contiguous(), (16, 16))
-    w_dn = shuffle_weight(dn.contiguous(), (16, 16))
-    w_ug.is_shuffled = True
-    w_dn.is_shuffled = True
-    return {
-        "w_ug": w_ug,
-        "s_ug": shuffle_scale(gus.reshape(slices * 2 * part, -1).contiguous()),
-        "w_dn": w_dn,
-        "s_dn": shuffle_scale(dns.reshape(slices * hidden, -1).contiguous()),
-    }
+    return weight, scale
 
 
-__all__ = [
-    "LayerWeights",
-    "atom_mxfp4_storage_view",
-    "prepare_mxfp4_expert_storage",
-]
+def _linear(name: str, linear, rows: int, cols: int):
+    """A block-FP8 linear as SGLang keeps it after loading: (weight, scales,
+    shuffled), shuffled meaning AITER's (16, 16) layout in place."""
+    w, sc = _fp8(name, linear.weight, getattr(linear, "weight_scale_inv", None), rows, cols)
+    shuffled = getattr(linear, "aiter_bpreshuffled", False) or getattr(
+        linear.weight, "is_shuffled", False
+    )
+    return w, sc, bool(shuffled)
+
+
+def experts_reason(moe) -> Optional[str]:
+    """Why the kernel cannot read this MoE's experts in place, or None."""
+    experts = getattr(moe, "experts", None)
+    w13 = getattr(experts, "w13_weight", None)
+    if w13 is None:
+        return "no fused experts (w13_weight)"
+    if w13.dtype != torch.float8_e4m3fn:
+        return f"needs block-FP8 experts, got {w13.dtype}"
+    if w13.shape[0] != PHYSICAL_EXPERTS:
+        return (
+            f"needs the shared expert fused as expert {N_EXPERTS} "
+            f"({PHYSICAL_EXPERTS} experts), got {w13.shape[0]}"
+        )
+    return None
+
+
+def _uk_uv(attn, heads: int, idx: int, copies: dict):
+    """W_UK [H * 512, 192] and W_UV [H * 256, 512] packed from SGLang's per-tensor
+    FP8 ``w_kc`` / ``w_vc``, every block scale ``w_scale``: the values SGLang's
+    own absorbed attention multiplies by."""
+    w_kc, w_vc, w_scale = attn.w_kc, attn.w_vc, getattr(attn, "w_scale", None)
+    if w_kc.dtype != torch.float8_e4m3fn or w_scale is None or w_scale.numel() != 1:
+        raise ValueError(
+            f"needs w_kc / w_vc as per-tensor FP8 E4M3 with a scalar w_scale, got "
+            f"{w_kc.dtype} and {None if w_scale is None else tuple(w_scale.shape)}"
+        )
+    if tuple(w_kc.shape) != (heads, NOPE_DIM, KV_LORA) or tuple(w_vc.shape) != (
+        heads,
+        KV_LORA,
+        V_DIM,
+    ):
+        raise ValueError(
+            f"needs w_kc [{heads}, {NOPE_DIM}, {KV_LORA}] and w_vc [{heads}, "
+            f"{KV_LORA}, {V_DIM}], got {tuple(w_kc.shape)} and {tuple(w_vc.shape)}"
+        )
+    uk = w_kc.transpose(1, 2).reshape(heads * KV_LORA, NOPE_DIM)
+    uv = w_vc.transpose(1, 2).reshape(heads * V_DIM, KV_LORA)
+    scale = float(w_scale.float().item())
+    dev = uk.device
+    w_uk, w_uv = pack_fp8(uk.contiguous()), pack_fp8(uv.contiguous())
+    s_uk = torch.full(
+        (heads * KV_LORA // 128, NOPE_DIM // 64), scale, dtype=torch.float32, device=dev
+    )
+    s_uv = torch.full(
+        (heads * V_DIM // 128, KV_LORA // 128), scale, dtype=torch.float32, device=dev
+    )
+    for name, t in (("w_uk", w_uk), ("w_uv", w_uv), ("s_uk", s_uk), ("s_uv", s_uv)):
+        copies["W_UK / W_UV packed", idx, name] = t
+    return w_uk, s_uk, w_uv, s_uv
+
+
+def _indexer(attn, idx: int, copies: dict):
+    """An indexer layer's pointer table (wk, its scales, weights_proj packed, wq_b,
+    its scales, k LayerNorm weight and bias in f32, no timeline) and what it
+    points at."""
+    ind = attn.indexer
+    w_k, s_k, sh_k = _linear("indexer.wk", ind.wk, INDEX_DIM, HIDDEN)
+    w_q, s_q, sh_q = _linear("indexer.wq_b", ind.wq_b, INDEX_HEADS * INDEX_DIM, Q_LORA)
+    w_w = _need(
+        "indexer.weights_proj",
+        ind.weights_proj.weight,
+        (INDEX_HEADS, HIDDEN),
+        (torch.bfloat16,),
+    )
+    w_w = pack_bf16(w_w)
+    ln = ind.k_norm
+    g_k = ln.weight.detach().float().contiguous()
+    b_k = ln.bias.detach().float().contiguous()
+    copies["indexer weights_proj packed", idx] = w_w
+    copies["indexer k LayerNorm f32", idx, "weight"] = g_k
+    copies["indexer k LayerNorm f32", idx, "bias"] = b_k
+    keep = (w_k, s_k, w_w, w_q, s_q, g_k, b_k)
+    table = torch.tensor(
+        [t.data_ptr() for t in keep] + [0], dtype=torch.int64, device=w_k.device
+    )
+    return table, keep, (sh_k, sh_q)
+
+
+def layer_weights(layer, idx: int, tp: int, copies: dict):
+    """A covered layer's tensors (``Glm53Weights``)."""
+    from .runner import Glm53Weights
+
+    attn, moe = layer.self_attn, layer.mlp
+    heads = GLM5_GLOBAL_HEADS // tp
+    bf16 = (torch.bfloat16,)
+    g_in = _need("input_layernorm", layer.input_layernorm.weight, (HIDDEN,), bf16)
+    g_post = _need(
+        "post_attention_layernorm", layer.post_attention_layernorm.weight, (HIDDEN,), bf16
+    )
+    g_q = _need("q_a_layernorm", attn.q_a_layernorm.weight, (Q_LORA,), bf16)
+    g_kv = _need("kv_a_layernorm", attn.kv_a_layernorm.weight, (KV_LORA,), bf16)
+    w_qkv, s_qkv, sh_qkv = _linear(
+        "fused_qkv_a_proj_with_mqa", attn.fused_qkv_a_proj_with_mqa, QKV_A, HIDDEN
+    )
+    w_qb, s_qb, sh_qb = _linear(
+        "q_b_proj", attn.q_b_proj, heads * (NOPE_DIM + PE_DIM), Q_LORA
+    )
+    w_o, s_o, sh_o = _linear("o_proj", attn.o_proj, HIDDEN, heads * V_DIM)
+    w_uk, s_uk, w_uv, s_uv = _uk_uv(attn, heads, idx, copies)
+    why = experts_reason(moe)
+    if why is not None:
+        raise ValueError(why)
+    experts = moe.experts
+    inter = experts.w13_weight.shape[1] // 2
+    w_ug = _need(
+        "w13_weight",
+        experts.w13_weight,
+        (PHYSICAL_EXPERTS, 2 * inter, HIDDEN),
+        (torch.float8_e4m3fn,),
+    )
+    s_ug = _need(
+        "w13_weight_scale_inv",
+        experts.w13_weight_scale_inv,
+        (PHYSICAL_EXPERTS, 2 * inter // 128, HIDDEN // 128),
+        (torch.float32,),
+    )
+    w_dn = _need(
+        "w2_weight",
+        experts.w2_weight,
+        (PHYSICAL_EXPERTS, HIDDEN, inter),
+        (torch.float8_e4m3fn,),
+    )
+    s_dn = _need(
+        "w2_weight_scale_inv",
+        experts.w2_weight_scale_inv,
+        (PHYSICAL_EXPERTS, HIDDEN // 128, inter // 128),
+        (torch.float32,),
+    )
+    gate = moe.gate
+    w_r = pack_bf16(
+        _need("gate", gate.weight, (N_EXPERTS, HIDDEN), (torch.bfloat16, torch.float32))
+        .to(torch.bfloat16)
+        .contiguous()
+    )
+    copies["router packed", idx] = w_r
+    bias = _need(
+        "e_score_correction_bias",
+        gate.e_score_correction_bias,
+        (N_EXPERTS,),
+        (torch.float32,),
+    )
+    index, keep, shuffles = None, (), (sh_qkv, sh_qb, sh_o)
+    if attn.indexer is not None:
+        index, keep, ind_shuffles = _indexer(attn, idx, copies)
+        shuffles += ind_shuffles
+    # SGLang shuffles its block-FP8 linears and AITER-run experts together
+    if len(set(shuffles)) != 1:
+        raise ValueError(
+            f"needs every block-FP8 projection in one layout, got shuffled {shuffles}"
+        )
+    return Glm53Weights(
+        g_in=g_in,
+        g_q=g_q,
+        g_kv=g_kv,
+        g_post=g_post,
+        w_qkv_a=w_qkv,
+        s_qkv_a=s_qkv,
+        w_q_b=w_qb,
+        s_q_b=s_qb,
+        w_uk=w_uk,
+        s_uk=s_uk,
+        w_uv=w_uv,
+        s_uv=s_uv,
+        w_o=w_o,
+        s_o=s_o,
+        w_r=w_r,
+        bias=bias,
+        w_ug=w_ug,
+        s_ug=s_ug,
+        w_dn=w_dn,
+        s_dn=s_dn,
+        shuffled=shuffles[0],
+        index=index,
+        keep=keep,
+    )
+
+
+def _cos_sin(rotary):
+    """A rotary's (cos, sin) [positions, 32]: SGLang's f32 ``cos_sin_cache``
+    [positions, 64] (cos, then sin), or AITER's ``cos_cache`` and ``sin_cache``."""
+    cache = getattr(rotary, "cos_sin_cache", None)
+    if cache is not None:
+        return cache[:, : PE_DIM // 2], cache[:, PE_DIM // 2 :]
+    cos, sin = rotary.cos_cache, rotary.sin_cache
+    return cos.reshape(cos.shape[0], -1), sin.reshape(sin.shape[0], -1)
+
+
+def rope_tables(layer, copies: dict):
+    """The bf16 cos and sin tables [positions, 32] both rotaries read, from the
+    MLA rotary; the indexer's must equal it."""
+    attn = layer.self_attn
+    cos, sin = _cos_sin(attn.rotary_emb)
+    ind_rotary = getattr(attn.indexer, "rotary_emb", None)
+    if ind_rotary is not None:
+        ic, is_ = _cos_sin(ind_rotary)
+        if ic.shape != cos.shape or not (torch.equal(ic, cos) and torch.equal(is_, sin)):
+            raise ValueError("needs the indexer's rotary table to equal the MLA one")
+    if cos.dim() != 2 or cos.shape[1] != PE_DIM // 2:
+        raise ValueError(
+            f"needs rotary tables [positions, {PE_DIM // 2}], got {tuple(cos.shape)}"
+        )
+    cos = cos.to(torch.bfloat16).contiguous()
+    sin = sin.to(torch.bfloat16).contiguous()
+    copies["rotary cos / sin bf16", "cos"] = cos
+    copies["rotary cos / sin bf16", "sin"] = sin
+    return cos, sin

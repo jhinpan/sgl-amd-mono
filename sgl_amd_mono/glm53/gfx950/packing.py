@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import torch
 
-from aiter.ops.flydsl.kernels.glm5_mono.config import (
+from .config import (
     GLM5_CONFIG,
     AttentionWeight,
     ExpertWeight,

@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from aiter.ops.flydsl.kernels.glm5_mono.config import (
+from .config import (
     MAX_LAYERS_PER_STEP,
 )
 

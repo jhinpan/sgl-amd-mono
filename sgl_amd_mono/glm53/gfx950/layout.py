@@ -3,7 +3,7 @@
 
 """Compile-time storage layout and CTA schedule for the GLM-5 MonoKernel."""
 
-from aiter.ops.flydsl.kernels.glm5_mono.config import (
+from .config import (
     HIDDEN,
     INTER,
     KV_LORA,
@@ -16,7 +16,7 @@ from aiter.ops.flydsl.kernels.glm5_mono.config import (
     TOP_K,
     V_DIM,
 )
-from aiter.ops.flydsl.kernels.glm5_mono.layout import (
+from .tiles import (
     BLOCKS,
     Q_B_TILE,
     QKV_A_TILE,
@@ -201,9 +201,11 @@ def layout(
         "attn": 0,
         "ffn": region,
         "dcp": 2 * region,
+        # the guard's error flags: rank r writes word r of every rank's flags
+        "flags": 2 * region + 2 * dcp_part,
         "_part_stride": part,
         "_dcp_part_stride": dcp_part,
-        "_bytes": 2 * region + 2 * dcp_part,
+        "_bytes": 2 * region + 2 * dcp_part + 256,
     }
     return scratch, symmetric
 

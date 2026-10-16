@@ -51,8 +51,10 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Int64, T
+from sgl_amd_mono.common import guard
+from sgl_amd_mono.common.epoch import spin_until
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from aiter.ops.flydsl.kernels.glm5_mono.config import (
+from .config import (
     AttentionWeight,
     EPS,
     FP8_MAX,
@@ -73,7 +75,7 @@ from aiter.ops.flydsl.kernels.glm5_mono.config import (
     V_DIM,
     as_kv_cache_layout,
 )
-from aiter.ops.flydsl.kernels.glm5_mono.glm.layout import (
+from .layout import (
     BLOCKS,
     DCP_SUMMARY_PAIRS,
     INDEX_DIM,
@@ -112,7 +114,7 @@ from aiter.ops.flydsl.kernels.glm5_mono.glm.layout import (
     ug_split,
     ug_task_rounds,
 )
-from aiter.ops.flydsl.kernels.glm5_mono.layout import (
+from .tiles import (
     CM_DEV,
     CM_SYS,
     LAYER_SLOTS,
@@ -122,48 +124,47 @@ from aiter.ops.flydsl.kernels.glm5_mono.layout import (
     TL_COLS,
     atom_mxfp4_scale_index,
 )
-from aiter.ops.flydsl.kernels.glm5_mono.ops import (
+from .ops import (
     bpermute_i32,
     div_rn,
     f8_word,
     fp8_pack4,
     mem_realtime,
     read_lane_i32,
-    spin_pause,
     wave_umax_dpp,
     write_lane_i32,
 )
-from aiter.ops.flydsl.kernels.glm5_mono.ops import (
+from .ops import (
     exp as _exp,
 )
-from aiter.ops.flydsl.kernels.glm5_mono.ops import (
+from .ops import (
     fp8_roundtrip as _fp8_roundtrip,
 )
-from aiter.ops.flydsl.kernels.glm5_mono.ops import (
+from .ops import (
     fp8_to_bf16x8 as _fp8_to_bf16x8,
 )
-from aiter.ops.flydsl.kernels.glm5_mono.ops import (
+from .ops import (
     mxfp4_to_bf16x8 as _mxfp4_to_bf16x8,
 )
-from aiter.ops.flydsl.kernels.glm5_mono.ops import (
+from .ops import (
     rcp as _rcp,
 )
-from aiter.ops.flydsl.kernels.glm5_mono.ops import (
+from .ops import (
     rsq as _rsq,
 )
-from aiter.ops.flydsl.kernels.glm5_mono.ops import (
+from .ops import (
     rsrc as _rsrc,
 )
-from aiter.ops.flydsl.kernels.glm5_mono.ops import (
+from .ops import (
     uniform as _uniform,
 )
-from aiter.ops.flydsl.kernels.glm5_mono.ops import (
+from .ops import (
     uniform_f32 as _uniform_f32,
 )
-from aiter.ops.flydsl.kernels.glm5_mono.ops import (
+from .ops import (
     xred as _xred,
 )
-from aiter.ops.flydsl.kernels.glm5_mono.ops import (
+from .ops import (
     xshfl as _xshfl,
 )
 
@@ -191,9 +192,12 @@ def build_glm5_monokernel(
     index_block_size: int = 64,
     index_block_bytes: int = 0,
     index_shuffled: bool = False,
-    block_table_stride: int = 0,
     index_k_bf16: bool = False,
     dense_experts: int = 0,
+    fp8_shuffled: bool = False,
+    fault_site: int = 0,
+    fault_after: int = 0,
+    stop: bool = True,
 ):
     """Return the ``@flyc.jit`` launcher for one rank's whole layer.
 
@@ -240,7 +244,6 @@ def build_glm5_monokernel(
     assert not index_paged or (
         with_indexer
         and use_atom_kv_cache
-        and block_table_stride > 0
         and index_block_bytes >= index_block_size * (INDEX_DIM + 4)
         and index_block_bytes % 4 == 0
         and (not index_shuffled or index_block_size % 16 == 0)
@@ -421,7 +424,24 @@ def build_glm5_monokernel(
         out_indices: Int64,
         rank: Int32,
         layer: Int32,
+        bt_stride: Int32,
     ):
+        # every wait of this launch runs under the guard (deadline, error words);
+        # the scope is entered by hand so the traced body keeps its indentation
+        guarded = guard.scope(
+            guard.Guard(
+                step,
+                own=sym,
+                peers=peers,
+                rank=rank,
+                npes=W,
+                flags_offset=SY["flags"],
+                fault_site=fault_site or None,
+                fault_after=fault_after,
+                stop=stop,
+            )
+        )
+        guarded.__enter__()
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         lane = tid % 64
@@ -510,7 +530,7 @@ def build_glm5_monokernel(
             return fx.Int32(
                 bo.buffer_load(
                     _rsrc(block_table),
-                    req * block_table_stride + key // index_block_size,
+                    req * bt_stride + key // index_block_size,
                     vec_width=1,
                     dtype=T.i32,
                 )
@@ -537,6 +557,18 @@ def build_glm5_monokernel(
 
         def lds_st(ptr, i, v):
             fx.ptr_store(v, ptr + i)
+
+        def fwht128(v0, v1):
+            """The orthonormal 128-point Hadamard transform (Sylvester order) of the
+            values one wave holds, lane l holding entries 2l and 2l + 1."""
+            v0, v1 = v0 + v1, v0 - v1
+            for j in range_constexpr(6):
+                m = 1 << j
+                p0, p1 = _xshfl(v0, m), _xshfl(v1, m)
+                upper = (lane & m) != 0
+                v0 = upper.select(p0 - v0, v0 + p0)
+                v1 = upper.select(p1 - v1, v1 + p1)
+            return v0 * (128**-0.5), v1 * (128**-0.5)
 
         def bf16_pair(a, b):
             """Two f32 -> one f32-typed word holding (bf16(a), bf16(b))."""
@@ -665,10 +697,7 @@ def build_glm5_monokernel(
                     bad = bad | (v[e] != tag)
                 return bad
 
-            v = load_all()
-            while pending(v):
-                spin_pause()
-                v = load_all()
+            v = spin_until(load_all, pending)
             outs_, e = [], 0
             for _, _, n in specs:
                 outs_.append([v[e + 2 * q] for q in range(n)])
@@ -771,14 +800,32 @@ def build_glm5_monokernel(
             return t
 
         # ------------------------------------------------ MFMA GEMV machinery
-        def unit_fp8(w_rsrc, s_rsrc, rg, kc, NKC, K, BK, b_word, coef=None):
-            """Issue one 64-k chunk of row group ``rg`` of a packed FP8 matrix; the
-            bf16 activation chunk starts at LDS word ``b_word``."""
-            wv = fx.Vector(
+        def ld_fp8_chunk(w_rsrc, rg, kc, NKC, K, ln, shuffled):
+            """The 16 bytes lane ``ln`` holds of 64-k chunk ``kc`` of row group ``rg``:
+            packed (``pack_fp8``), or two 8-byte halves of AITER's (16, 16) layout
+            ([rows / 16, K / 32, 2, 16 rows, 16 bytes]) in the same order."""
+            if const_expr(shuffled):
+                b, r = ln // 16, ln % 16
+                word = (
+                    (rg * (K // 32) + 2 * kc) * 512 + (b // 2) * 256 + r * 16 + (b % 2) * 8
+                ) // 4
+                lo = fx.Vector(bo.buffer_load(w_rsrc, word, vec_width=2, dtype=T.i32))
+                hi = fx.Vector(
+                    bo.buffer_load(w_rsrc, word + 128, vec_width=2, dtype=T.i32)
+                )
+                return fx.Vector.from_elements([lo[0], lo[1], hi[0], hi[1]], fx.Int32)
+            return fx.Vector(
                 bo.buffer_load(
-                    w_rsrc, ((rg * NKC + kc) * 64 + lane) * 4, vec_width=4, dtype=T.i32
+                    w_rsrc, ((rg * NKC + kc) * 64 + ln) * 4, vec_width=4, dtype=T.i32
                 )
             )
+
+        def unit_fp8(
+            w_rsrc, s_rsrc, rg, kc, NKC, K, BK, b_word, coef=None, shuffled=False
+        ):
+            """Issue one 64-k chunk of row group ``rg`` of an FP8 matrix; the
+            bf16 activation chunk starts at LDS word ``b_word``."""
+            wv = ld_fp8_chunk(w_rsrc, rg, kc, NKC, K, lane, shuffled)
             s = ld_f32(s_rsrc, (rg * 16 // SCALE_BM) * (K // BK) + kc * 64 // BK)
             if const_expr(callable(coef)):  # factor known only after a later wait
                 return ("fp8", [wv], lambda: s * coef(), b_word + (lane // 16) * 4)
@@ -787,18 +834,20 @@ def build_glm5_monokernel(
             return ("fp8", [wv], s, b_word + (lane // 16) * 4)
 
         def unit_fp8x2(
-            w_rsrc, s_rsrc, rg, kc, NKC, K, b_word, coef=None, scale_rows=SCALE_BM
+            w_rsrc,
+            s_rsrc,
+            rg,
+            kc,
+            NKC,
+            K,
+            b_word,
+            coef=None,
+            scale_rows=SCALE_BM,
+            shuffled=False,
         ):
             """Issue both 64-k halves of one 128-k FP8 weight-scale block."""
             wv = [
-                fx.Vector(
-                    bo.buffer_load(
-                        w_rsrc,
-                        ((rg * NKC + kc + h) * 64 + lane) * 4,
-                        vec_width=4,
-                        dtype=T.i32,
-                    )
-                )
+                ld_fp8_chunk(w_rsrc, rg, kc + h, NKC, K, lane, shuffled)
                 for h in range(2)
             ]
             s = ld_f32(s_rsrc, (rg * 16 // scale_rows) * (K // 128) + kc // 2)
@@ -808,21 +857,16 @@ def build_glm5_monokernel(
                 s = s * coef
             return ("fp8x2", wv, s, b_word + (lane // 16) * 4)
 
-        def unit_f8f8(w_rsrc, s_rsrc, rg, kc, NKC, K, b_word, coef, ln=None):
+        def unit_f8f8(
+            w_rsrc, s_rsrc, rg, kc, NKC, K, b_word, coef, ln=None, shuffled=False
+        ):
             """Issue one 128-k chunk (packed 64-k chunks kc, kc + 1; kc even) of row group
             ``rg`` against the FP8 activation of LDS words ``b_word`` + [0, 32) (``f8_word``
             order); ``coef()`` = activation block scale (times route weight).  ``ln``
             = the lane whose weights are loaded (default: own lane)."""
             ln = lane if ln is None else ln
             wv = [
-                fx.Vector(
-                    bo.buffer_load(
-                        w_rsrc,
-                        ((rg * NKC + kc + h) * 64 + ln) * 4,
-                        vec_width=4,
-                        dtype=T.i32,
-                    )
-                )
+                ld_fp8_chunk(w_rsrc, rg, kc + h, NKC, K, ln, shuffled)
                 for h in range(2)
             ]
             s = ld_f32(s_rsrc, (rg * 16 // SCALE_BM) * (K // 128) + kc // 2)
@@ -991,6 +1035,7 @@ def build_glm5_monokernel(
             ln=None,
             scale_rows=SCALE_BM,
             coef=None,
+            shuffled=False,
         ):
             if const_expr(attention_bf16):
                 return unit_bf16(w_rsrc, rg, kc, NKC, b_word, ln)
@@ -999,9 +1044,19 @@ def build_glm5_monokernel(
                     return unit_ptpc64(w_rsrc, rg, kc, NKC, b_word, coef=coef, ln=ln)
                 return unit_ptpc(w_rsrc, rg, kc, NKC, b_word, coef=coef, ln=ln)
             if const_expr(BK == 64):
-                return unit_fp8(w_rsrc, s_rsrc, rg, kc, NKC, K, BK, b_word)
+                return unit_fp8(
+                    w_rsrc, s_rsrc, rg, kc, NKC, K, BK, b_word, shuffled=shuffled
+                )
             return unit_fp8x2(
-                w_rsrc, s_rsrc, rg, kc, NKC, K, b_word, scale_rows=scale_rows
+                w_rsrc,
+                s_rsrc,
+                rg,
+                kc,
+                NKC,
+                K,
+                b_word,
+                scale_rows=scale_rows,
+                shuffled=shuffled,
             )
 
         def mma_units(acc, units):
@@ -1719,6 +1774,7 @@ def build_glm5_monokernel(
                         HIDDEN,
                         128,
                         attention_b_word(n_sel(group_count) * HIDDEN + kc * 64),
+                        shuffled=fp8_shuffled,
                     )
 
                 def ld_h(sks):
@@ -1822,6 +1878,7 @@ def build_glm5_monokernel(
                                     QA_NKC,
                                     HIDDEN,
                                     (n_sel(group_count) * HIDDEN + kc * 64) // 2,
+                                    shuffled=fp8_shuffled,
                                 )
 
                             ik_acc = run_units(u_index_k, QA_UNITS, QA_UNITS)
@@ -1990,10 +2047,9 @@ def build_glm5_monokernel(
                     put2(mb("penew"), s * PE_DIM + tid * 2, p0, p1)
 
             if const_expr(with_indexer):
-                # Index keys use LayerNorm (not RMSNorm), interleaved RoPE on
-                # the first 64 dimensions, and BF16 cache storage. Hadamard is
-                # omitted because applying the same orthogonal transform to Q
-                # and K leaves their dot products unchanged.
+                # Index keys use LayerNorm (not RMSNorm), interleaved RoPE on the
+                # first 64 dimensions, then the 128-point Hadamard that SGLang's
+                # gfx950 indexer applies to the keys it caches and to its queries.
                 r_gik, r_bik = _rsrc(index_arg(5)), _rsrc(index_arg(6))
                 r_index_cache = _rsrc(indices)
                 for s in range_constexpr(S):
@@ -2015,6 +2071,7 @@ def build_glm5_monokernel(
                         if tid < PE_DIM // 2:
                             c, sn = cs[s], sns[s]
                             v0, v1 = v0 * c - v1 * sn, v0 * sn + v1 * c
+                        v0, v1 = fwht128(v0, v1)
                         if const_expr(index_paged):
                             # vLLM's ue8m0 quant: scale = 2^ceil(log2(max(amax, 1e-4) / 448))
                             amax = wave_max(fx.max(fmath.absf(v0), fmath.absf(v1)))
@@ -2088,6 +2145,7 @@ def build_glm5_monokernel(
                     Q_LORA,
                     128,
                     attention_b_word(n_sel() * Q_LORA + kc * 64),
+                    shuffled=fp8_shuffled,
                 )
 
             pre = [u_qb(c) for c in range(QB_UNITS)]
@@ -2160,6 +2218,7 @@ def build_glm5_monokernel(
                         QB_NKC,
                         Q_LORA,
                         (n_sel() * Q_LORA + kc * 64) // 2,
+                        shuffled=fp8_shuffled,
                     )
 
                 iq_acc = run_units(u_index_q, QB_UNITS, QB_UNITS)
@@ -2196,6 +2255,7 @@ def build_glm5_monokernel(
                         QB_NKC,
                         Q_LORA,
                         (n_sel() * Q_LORA + kc * 64) // 2,
+                        shuffled=fp8_shuffled,
                     )
 
                 pre = [u_index_q_extra(c) for c in range(QB_UNITS)]
@@ -2351,6 +2411,7 @@ def build_glm5_monokernel(
                                 _rsrc(rope_sin), (pos0 + s) * (PE_DIM // 2) + kq // 2
                             )
                             q0, q1 = q0 * c - q1 * sn, q0 * sn + q1 * c
+                        q0, q1 = fwht128(q0, q1)
                         lds_st(xs, q_pair, bf16_pair(q0, q1))
                     gpu.barrier()
                     key_group = wave // 2
@@ -2622,6 +2683,7 @@ def build_glm5_monokernel(
                             c = ld_bf16(_rsrc(rope_cos), pos * (PE_DIM // 2) + kq // 2)
                             sn = ld_bf16(_rsrc(rope_sin), pos * (PE_DIM // 2) + kq // 2)
                             q0, q1 = q0 * c - q1 * sn, q0 * sn + q1 * c
+                        q0, q1 = fwht128(q0, q1)
                         lds_st(xs, q_pair, bf16_pair(q0, q1))
                     gpu.barrier()
                 for tile in range(first_tile, n_tiles, G):
@@ -3536,6 +3598,7 @@ def build_glm5_monokernel(
                     O_K,
                     128,
                     attention_b_word(n_sel() * O_K + kc * 64),
+                    shuffled=fp8_shuffled,
                 )
 
             pre = [u_o(c) for c in range(O_UNITS)]
@@ -3776,6 +3839,7 @@ def build_glm5_monokernel(
                     HIDDEN,
                     kc * 16,
                     lambda: _uniform_f32(lds_ld(misc, 8 + kc // 2)),
+                    shuffled=fp8_shuffled,
                 )
 
             return u_ug
@@ -3882,13 +3946,8 @@ def build_glm5_monokernel(
                             w_ln,
                         )
                     wv = [
-                        fx.Vector(
-                            bo.buffer_load(
-                                r_wug,
-                                ((w_rg * UG_NKC + kc + h) * 64 + w_ln) * 4,
-                                vec_width=4,
-                                dtype=T.i32,
-                            )
+                        ld_fp8_chunk(
+                            r_wug, w_rg, kc + h, UG_NKC, HIDDEN, w_ln, fp8_shuffled
                         )
                         for h in range(2)
                     ]
@@ -4071,13 +4130,8 @@ def build_glm5_monokernel(
                                     )
                                 continue
                             wv = [
-                                fx.Vector(
-                                    bo.buffer_load(
-                                        rw,
-                                        ((w_rg * UG_NKC + kc + j) * 64 + w_ln) * 4,
-                                        vec_width=4,
-                                        dtype=T.i32,
-                                    )
+                                ld_fp8_chunk(
+                                    rw, w_rg, kc + j, UG_NKC, HIDDEN, w_ln, fp8_shuffled
                                 )
                                 for j in range(2)
                             ]
@@ -4208,6 +4262,7 @@ def build_glm5_monokernel(
                         HIDDEN,
                         bsel * XW + kb * 32,
                         lambda: lds_ld(misc, 8 + bsel * XQ_BLOCKS + kb),
+                        shuffled=fp8_shuffled,
                     )
 
                 return (shared, s_u, slot, c, e_sel, prob, [mk(kb) for kb in kbs])
@@ -4440,7 +4495,7 @@ def build_glm5_monokernel(
                         dn_ln,
                     )
                 return unit_f8f8(
-                    wb, sb, dn_rg + gu, kc, DN_NKC, expert_inter, q * 16, coef, dn_ln
+                    wb, sb, dn_rg + gu, kc, DN_NKC, expert_inter, q * 16, coef, dn_ln, shuffled=fp8_shuffled
                 )
 
             if const_expr(S <= 4):
@@ -4521,6 +4576,7 @@ def build_glm5_monokernel(
             peer_reduce("ffn", t, residual_a, store_x, tile=DN_TILE)
             gpu.barrier()
             stamp("down", t, 4)
+        guarded.__exit__(None, None, None)
 
     @flyc.jit
     def launch(
@@ -4565,6 +4621,7 @@ def build_glm5_monokernel(
         out_indices: Int64,
         rank: Int32,
         layer: Int32,
+        bt_stride: Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         glm5_monokernel(
@@ -4609,6 +4666,7 @@ def build_glm5_monokernel(
             out_indices,
             rank,
             layer,
+            bt_stride,
         ).launch(grid=(G,), block=(THREADS,), stream=stream)
 
     return launch
