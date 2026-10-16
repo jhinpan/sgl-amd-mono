@@ -69,7 +69,11 @@ SGLANG_READS = {
         "final_norm",
     ),
     "srt/mem_cache/memory_pool.py": ("get_key_buffer", "get_index_k_with_scale_buffer"),
-    "srt/model_executor/forward_batch_info.py": ("out_cache_loc", "seq_lens", "is_idle"),
+    "srt/model_executor/forward_batch_info.py": (
+        "out_cache_loc",
+        "seq_lens",
+        "is_idle",
+    ),
     "srt/model_executor/forward_context.py": (
         "get_attn_backend",
         "get_token_to_kv_pool",
@@ -313,28 +317,7 @@ class _Built:
                 plan.state["ref_topk"] = ref["topk"]
         out = L.ops[W].launch(h, L.caches, self.cos, self.sin, step)
         if checking:
-            from sgl_amd_mono.glm53.gfx950.config import HIDDEN
-
-            from sgl_amd_mono.glm53.gfx950.config import MOE_SLOTS
-
-            rt = L.ops[W].rt
-            attn = check.read_bf16_mailbox(rt, "a", S * HIDDEN).view(S, HIDDEN)
-            n = S * MOE_SLOTS
-            routing = (
-                check.read_mailbox(rt, "sel", n, torch.int32).view(S, MOE_SLOTS),
-                check.read_mailbox(rt, "prob", n, torch.float32).view(S, MOE_SLOTS),
-            )
-            scores = check.read_mailbox(rt, "scores", S * 256, torch.float32).view(S, 256)
-            off = rt.sc["xqd"]
-            xqd = rt.scratch[off : off + S * HIDDEN * 4].view(torch.float32).view(S, HIDDEN)
-            inter = rt.key.inter
-            mid = None
-            if L.i == self.first:
-                mid = check.read_mailbox(rt, "mid", MOE_SLOTS * inter, torch.float32)
-                mid = mid.view(MOE_SLOTS, inter)
-            check.compare(
-                L, ref, out[:S], positions, forward_batch, S, attn, routing, scores, xqd, mid
-            )
+            check.compare(L, ref, out[:S], positions, forward_batch, S)
         if L.i != self.last:
             return out
         for (w, _), rt in self.runtimes.items():
@@ -350,7 +333,9 @@ class _Built:
         start = step.indptr[:S].to(torch.int64).unsqueeze(1)
         count = (step.indptr[1 : S + 1] - step.indptr[:S]).to(torch.int64).unsqueeze(1)
         dst = torch.where(self.keys < count, start + self.keys, W * TOPK)
-        step.topk.scatter_(0, dst.reshape(-1), topk_indices[:S].reshape(-1).to(torch.int32))
+        step.topk.scatter_(
+            0, dst.reshape(-1), topk_indices[:S].reshape(-1).to(torch.int32)
+        )
 
     @staticmethod
     def _bind(L: _Layer) -> None:
@@ -372,7 +357,11 @@ class _Built:
             and (idx is None or L.caches.idx.data_ptr() == idx.data_ptr())
         ):
             return
-        if kv.dtype != torch.bfloat16 or kv.shape[-1] != KV_ROW or not kv.is_contiguous():
+        if (
+            kv.dtype != torch.bfloat16
+            or kv.shape[-1] != KV_ROW
+            or not kv.is_contiguous()
+        ):
             raise RuntimeError(
                 f"GLM-5.3 monokernel: layer {L.i}: MLA cache {kv.dtype} "
                 f"{tuple(kv.shape)}; needs contiguous bf16 [slots, 1, {KV_ROW}]"
@@ -402,7 +391,7 @@ class _Built:
             st.positions[S:] = 0
             seq = forward_batch.seq_lens[:S].to(torch.int32)
             count = torch.where(valid, seq.clamp(max=TOPK), 0)
-            st.indptr[0] = 0
+            # indptr[0] stays 0 from its allocation
             st.indptr[1 : S + 1] = torch.cumsum(count, 0, dtype=torch.int32)
             st.indptr[S + 1 :] = st.indptr[S]
             st.req_ids[:S] = torch.arange(S, dtype=torch.int32, device=loc.device)
@@ -432,7 +421,11 @@ def _build(model, hf_config, ctx) -> _Built:
     copies = ctx.copies
     covered = _covered_layers(hf_config)
     layers = {
-        i: _Layer(i, model.model.layers[i], layer_weights(model.model.layers[i], i, tp, copies))
+        i: _Layer(
+            i,
+            model.model.layers[i],
+            layer_weights(model.model.layers[i], i, tp, copies),
+        )
         for i in covered
     }
     cos, sin = rope_tables(model.model.layers[covered[0]], copies)

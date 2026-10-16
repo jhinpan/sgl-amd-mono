@@ -48,20 +48,21 @@ https://github.com/SemiAnalysisAI/InferenceX/tree/8ac98344b038a3f2da20a565fe9b97
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from aiter.ops.flydsl.kernels import buffer_ops as bo
+from flydsl.expr import const_expr, gpu
 from flydsl.expr import math as fmath
+from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
+
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.epoch import spin_until
-from aiter.ops.flydsl.kernels import buffer_ops as bo
+
 from .config import (
-    AttentionWeight,
     EPS,
     FP8_MAX,
     HIDDEN,
     INTER,
     KV_LORA,
-    KvCacheLayout,
     MOE_SLOTS,
     N_EXPERTS,
     NOPE_DIM,
@@ -73,6 +74,8 @@ from .config import (
     SOFTMAX_SCALE,
     TOP_K,
     V_DIM,
+    AttentionWeight,
+    KvCacheLayout,
     as_kv_cache_layout,
 )
 from .layout import (
@@ -100,11 +103,11 @@ from .layout import (
     dcp_local_uv_tile,
     dcp_summary_index,
     dcp_uv_owner,
-    fp8_kv_upper_pair_lane,
-    fp8_pe_upper_pair_lane,
     dn_tile,
     down_prefetch_batch,
     down_x_words,
+    fp8_kv_upper_pair_lane,
+    fp8_pe_upper_pair_lane,
     layout,
     sample_wave_batches,
     sparse_keys_per_task,
@@ -114,6 +117,35 @@ from .layout import (
     ug_split,
     ug_task_rounds,
 )
+from .ops import (
+    bpermute_i32,
+    div_rn,
+)
+from .ops import exp as _exp
+from .ops import (
+    f8_word,
+    fp8_pack4,
+)
+from .ops import fp8_roundtrip as _fp8_roundtrip
+from .ops import fp8_to_bf16x8 as _fp8_to_bf16x8
+from .ops import (
+    mem_realtime,
+)
+from .ops import mxfp4_to_bf16x8 as _mxfp4_to_bf16x8
+from .ops import rcp as _rcp
+from .ops import (
+    read_lane_i32,
+)
+from .ops import rsq as _rsq
+from .ops import rsrc as _rsrc
+from .ops import uniform as _uniform
+from .ops import uniform_f32 as _uniform_f32
+from .ops import (
+    wave_umax_dpp,
+    write_lane_i32,
+)
+from .ops import xred as _xred
+from .ops import xshfl as _xshfl
 from .tiles import (
     CM_DEV,
     CM_SYS,
@@ -124,49 +156,7 @@ from .tiles import (
     TL_COLS,
     atom_mxfp4_scale_index,
 )
-from .ops import (
-    bpermute_i32,
-    div_rn,
-    f8_word,
-    fp8_pack4,
-    mem_realtime,
-    read_lane_i32,
-    wave_umax_dpp,
-    write_lane_i32,
-)
-from .ops import (
-    exp as _exp,
-)
-from .ops import (
-    fp8_roundtrip as _fp8_roundtrip,
-)
-from .ops import (
-    fp8_to_bf16x8 as _fp8_to_bf16x8,
-)
-from .ops import (
-    mxfp4_to_bf16x8 as _mxfp4_to_bf16x8,
-)
-from .ops import (
-    rcp as _rcp,
-)
-from .ops import (
-    rsq as _rsq,
-)
-from .ops import (
-    rsrc as _rsrc,
-)
-from .ops import (
-    uniform as _uniform,
-)
-from .ops import (
-    uniform_f32 as _uniform_f32,
-)
-from .ops import (
-    xred as _xred,
-)
-from .ops import (
-    xshfl as _xshfl,
-)
+
 
 def build_glm5_monokernel(
     S: int = 1,
@@ -238,9 +228,9 @@ def build_glm5_monokernel(
     assert not with_indexer or (
         topk == 2048 and index_max_seq % INDEX_KEYS_PER_TASK == 0
     )
-    assert not (
-        attention_bf16 and with_indexer
-    ), "BF16 attention uses the external indexer"
+    assert not (attention_bf16 and with_indexer), (
+        "BF16 attention uses the external indexer"
+    )
     assert not index_paged or (
         with_indexer
         and use_atom_kv_cache
@@ -807,7 +797,10 @@ def build_glm5_monokernel(
             if const_expr(shuffled):
                 b, r = ln // 16, ln % 16
                 word = (
-                    (rg * (K // 32) + 2 * kc) * 512 + (b // 2) * 256 + r * 16 + (b % 2) * 8
+                    (rg * (K // 32) + 2 * kc) * 512
+                    + (b // 2) * 256
+                    + r * 16
+                    + (b % 2) * 8
                 ) // 4
                 lo = fx.Vector(bo.buffer_load(w_rsrc, word, vec_width=2, dtype=T.i32))
                 hi = fx.Vector(
@@ -866,8 +859,7 @@ def build_glm5_monokernel(
             = the lane whose weights are loaded (default: own lane)."""
             ln = lane if ln is None else ln
             wv = [
-                ld_fp8_chunk(w_rsrc, rg, kc + h, NKC, K, ln, shuffled)
-                for h in range(2)
+                ld_fp8_chunk(w_rsrc, rg, kc + h, NKC, K, ln, shuffled) for h in range(2)
             ]
             s = ld_f32(s_rsrc, (rg * 16 // SCALE_BM) * (K // 128) + kc // 2)
             return ("f8f8", wv, lambda: s * coef(), b_word + (lane // 16) * 4)
@@ -2828,7 +2820,11 @@ def build_glm5_monokernel(
                 def poll_keys(items):
                     vals = poll(
                         [
-                            (mb("index_scores"), s * index_max_seq + fx.min(i, bound - 1), 1)
+                            (
+                                mb("index_scores"),
+                                s * index_max_seq + fx.min(i, bound - 1),
+                                1,
+                            )
                             for i in items
                         ]
                     )
@@ -2841,7 +2837,10 @@ def build_glm5_monokernel(
                         w = fx.Vector(
                             bo.buffer_load(
                                 r_index_scores,
-                                (s * index_max_seq + fx.min(items[j], index_max_seq - 2))
+                                (
+                                    s * index_max_seq
+                                    + fx.min(items[j], index_max_seq - 2)
+                                )
                                 * 2,
                                 vec_width=4,
                                 dtype=T.i32,
@@ -2862,7 +2861,9 @@ def build_glm5_monokernel(
                     Returns (prefix with that digit, keys still needed, keys in that bin).
                     """
                     per = SEL_BINS // THREADS
-                    cs = [lds_ld(hist, SEL_BINS - 1 - (tid * per + j)) for j in range(per)]
+                    cs = [
+                        lds_ld(hist, SEL_BINS - 1 - (tid * per + j)) for j in range(per)
+                    ]
                     local = cs[0]
                     for c in cs[1:]:
                         local = local + c
@@ -2960,7 +2961,9 @@ def build_glm5_monokernel(
                             lds_st(red, gt_offsets[j], values[j].bitcast(fx.Float32))
                         if eq[j] & (eq_offsets[j] < remain):
                             lds_st(
-                                red, out_gt + eq_offsets[j], values[j].bitcast(fx.Float32)
+                                red,
+                                out_gt + eq_offsets[j],
+                                values[j].bitcast(fx.Float32),
                             )
 
                 def publish_all():
@@ -2985,10 +2988,14 @@ def build_glm5_monokernel(
                             (i < bound) & ((k >> level) == (prefix >> level))
                             for i, k in zip(items, item_keys)
                         ]
-                        win_offsets, cand_offsets, _, _ = scan_pair(high, same, chunk & 1)
+                        win_offsets, cand_offsets, _, _ = scan_pair(
+                            high, same, chunk & 1
+                        )
                         for j in range_constexpr(SEL_ITEMS):
                             if high[j]:
-                                lds_st(red, win_offsets[j], items[j].bitcast(fx.Float32))
+                                lds_st(
+                                    red, win_offsets[j], items[j].bitcast(fx.Float32)
+                                )
                             c = SEL_BINS + cand_offsets[j] * 2
                             if same[j]:
                                 lds_st(xs, c, item_keys[j].bitcast(fx.Float32))
@@ -3031,10 +3038,15 @@ def build_glm5_monokernel(
                             chunk,
                             [c < n_cand for c in idx],
                             [
-                                fx.Uint32(lds_ld(xs, SEL_BINS + c * 2).bitcast(fx.Int32))
+                                fx.Uint32(
+                                    lds_ld(xs, SEL_BINS + c * 2).bitcast(fx.Int32)
+                                )
                                 for c in safe
                             ],
-                            [lds_ld(xs, SEL_BINS + c * 2 + 1).bitcast(fx.Int32) for c in safe],
+                            [
+                                lds_ld(xs, SEL_BINS + c * 2 + 1).bitcast(fx.Int32)
+                                for c in safe
+                            ],
                             prefix,
                             out_gt,
                             remain,
@@ -3795,9 +3807,7 @@ def build_glm5_monokernel(
                         lane < MOE_SLOTS
                     ):  # slot 0: the shared expert, then pick lane (slot lane + 1)
                         q = route_sample * MOE_SLOTS + (lane + 1) % MOE_SLOTS
-                        lds_st(
-                            keys, q, (lane == TOP_K).select(fx.Int32(SHARED), e)
-                        )
+                        lds_st(keys, q, (lane == TOP_K).select(fx.Int32(SHARED), e))
                         lds_st(dnw, q, (lane == TOP_K).select(fx.Float32(1.0), w))
 
         # ================================ 9. expert up/gate + SiLU
@@ -3964,8 +3974,7 @@ def build_glm5_monokernel(
                 # the shared expert's weights do not depend on routing: prefetch them (the
                 # later zero-weight MMAs of the other tasks are cheaper than a branch)
                 pre = [
-                    u_ug8(cc, fx.Int32(SHARED), has_sh)
-                    for cc in range(UG8_CPW // 2)
+                    u_ug8(cc, fx.Int32(SHARED), has_sh) for cc in range(UG8_CPW // 2)
                 ]
                 hint_wait(
                     N_ROW_TILES,
@@ -4495,7 +4504,16 @@ def build_glm5_monokernel(
                         dn_ln,
                     )
                 return unit_f8f8(
-                    wb, sb, dn_rg + gu, kc, DN_NKC, expert_inter, q * 16, coef, dn_ln, shuffled=fp8_shuffled
+                    wb,
+                    sb,
+                    dn_rg + gu,
+                    kc,
+                    DN_NKC,
+                    expert_inter,
+                    q * 16,
+                    coef,
+                    dn_ln,
+                    shuffled=fp8_shuffled,
                 )
 
             if const_expr(S <= 4):

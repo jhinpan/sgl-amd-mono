@@ -87,7 +87,9 @@ def _fp8(name: str, weight, scale, rows: int, cols: int):
 def _linear(name: str, linear, rows: int, cols: int):
     """A block-FP8 linear as SGLang keeps it after loading: (weight, scales,
     shuffled), shuffled meaning AITER's (16, 16) layout in place."""
-    w, sc = _fp8(name, linear.weight, getattr(linear, "weight_scale_inv", None), rows, cols)
+    w, sc = _fp8(
+        name, linear.weight, getattr(linear, "weight_scale_inv", None), rows, cols
+    )
     shuffled = getattr(linear, "aiter_bpreshuffled", False) or getattr(
         linear.weight, "is_shuffled", False
     )
@@ -181,7 +183,10 @@ def layer_weights(layer, idx: int, tp: int, copies: dict):
     bf16 = (torch.bfloat16,)
     g_in = _need("input_layernorm", layer.input_layernorm.weight, (HIDDEN,), bf16)
     g_post = _need(
-        "post_attention_layernorm", layer.post_attention_layernorm.weight, (HIDDEN,), bf16
+        "post_attention_layernorm",
+        layer.post_attention_layernorm.weight,
+        (HIDDEN,),
+        bf16,
     )
     g_q = _need("q_a_layernorm", attn.q_a_layernorm.weight, (Q_LORA,), bf16)
     g_kv = _need("kv_a_layernorm", attn.kv_a_layernorm.weight, (KV_LORA,), bf16)
@@ -289,7 +294,9 @@ def rope_tables(layer, copies: dict):
     ind_rotary = getattr(attn.indexer, "rotary_emb", None)
     if ind_rotary is not None:
         ic, is_ = _cos_sin(ind_rotary)
-        if ic.shape != cos.shape or not (torch.equal(ic, cos) and torch.equal(is_, sin)):
+        if ic.shape != cos.shape or not (
+            torch.equal(ic, cos) and torch.equal(is_, sin)
+        ):
             raise ValueError("needs the indexer's rotary table to equal the MLA one")
     if cos.dim() != 2 or cos.shape[1] != PE_DIM // 2:
         raise ValueError(

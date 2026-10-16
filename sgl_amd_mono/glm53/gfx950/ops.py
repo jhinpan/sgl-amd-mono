@@ -6,12 +6,12 @@
 from __future__ import annotations
 
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
-from flydsl.expr import range_constexpr, rocdl
-from flydsl.expr import math as fmath
-from flydsl.expr.typing import T, as_ir_value
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
+from flydsl._mlir.dialects import llvm
+from flydsl.expr import math as fmath
+from flydsl.expr import range_constexpr, rocdl
+from flydsl.expr.typing import T, as_ir_value
 
 _UMAX_DPP_ASM = "\n".join(
     [
