@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025 FlyDSL Project Contributors
+# Adapted from ROCm/aiter#6173 at 56d6390def (Apache-2.0):
+# aiter/ops/flydsl/kernels/glm5_mono/weights.py
 """GLM-5.3's layer tensors as the kernel reads them, from SGLang's loaded modules
 (``Glm53Weights``). Projections and experts are SGLang's FP8 tensors in place;
 W_UK and W_UV, the router, the indexer's weights_proj and its k LayerNorm are
@@ -51,7 +54,11 @@ SGLANG_READS = {
         "w13_weight_scale_inv",
         "w2_weight",
         "w2_weight_scale_inv",
+        "runner",
     ),
+    "srt/layers/moe/fused_moe_triton/layer.py": ("quant_method",),
+    "srt/layers/moe/moe_runner/runner.py": ("runner_backend",),
+    "srt/layers/moe/utils.py": ("is_aiter",),
 }
 
 N_EXPERTS = 256
@@ -84,16 +91,36 @@ def _fp8(name: str, weight, scale, rows: int, cols: int):
     return weight, scale
 
 
+def _shuffled(linear) -> bool:
+    # SGLang sets these only on a linear it rewrote into AITER's (16, 16) layout
+    return bool(
+        getattr(linear, "aiter_bpreshuffled", False)
+        or getattr(linear.weight, "is_shuffled", False)
+    )
+
+
 def _linear(name: str, linear, rows: int, cols: int):
     """A block-FP8 linear as SGLang keeps it after loading: (weight, scales,
     shuffled), shuffled meaning AITER's (16, 16) layout in place."""
     w, sc = _fp8(
         name, linear.weight, getattr(linear, "weight_scale_inv", None), rows, cols
     )
-    shuffled = getattr(linear, "aiter_bpreshuffled", False) or getattr(
-        linear.weight, "is_shuffled", False
-    )
-    return w, sc, bool(shuffled)
+    return w, sc, _shuffled(linear)
+
+
+def unshuffled_projections(layer) -> list[str]:
+    """The layer's FP8 projections that SGLang left row-major: the kernel reads
+    every one in place in AITER's (16, 16) layout."""
+    attn = layer.self_attn
+    linears = {
+        "fused_qkv_a_proj_with_mqa": attn.fused_qkv_a_proj_with_mqa,
+        "q_b_proj": attn.q_b_proj,
+        "o_proj": attn.o_proj,
+    }
+    if attn.indexer is not None:
+        linears["indexer.wq_b"] = attn.indexer.wq_b
+        linears["indexer.wk"] = attn.indexer.wk
+    return [name for name, linear in linears.items() if not _shuffled(linear)]
 
 
 def experts_reason(moe) -> Optional[str]:
@@ -109,6 +136,10 @@ def experts_reason(moe) -> Optional[str]:
             f"needs the shared expert fused as expert {N_EXPERTS} "
             f"({PHYSICAL_EXPERTS} experts), got {w13.shape[0]}"
         )
+    # SGLang shuffles FP8 experts to (16, 16) only for its AITER MoE runner
+    runner = getattr(experts.quant_method, "runner", None)
+    if runner is None or not runner.runner_backend.is_aiter():
+        return "needs the experts on SGLang's AITER MoE runner, which shuffles them"
     return None
 
 
@@ -244,7 +275,7 @@ def layer_weights(layer, idx: int, tp: int, copies: dict):
     if attn.indexer is not None:
         index, keep, ind_shuffles = _indexer(attn, idx, copies)
         shuffles += ind_shuffles
-    # SGLang shuffles its block-FP8 linears and AITER-run experts together
+    # the kernel reads every in-place FP8 weight of a launch in one layout
     if len(set(shuffles)) != 1:
         raise ValueError(
             f"needs every block-FP8 projection in one layout, got shuffled {shuffles}"
@@ -286,14 +317,15 @@ def _cos_sin(rotary):
     return cos.reshape(cos.shape[0], -1), sin.reshape(sin.shape[0], -1)
 
 
-def rope_tables(layer, copies: dict):
-    """The bf16 cos and sin tables [positions, 32] both rotaries read, from the
-    MLA rotary; the indexer's must equal it."""
-    attn = layer.self_attn
-    cos, sin = _cos_sin(attn.rotary_emb)
-    ind_rotary = getattr(attn.indexer, "rotary_emb", None)
-    if ind_rotary is not None:
-        ic, is_ = _cos_sin(ind_rotary)
+def rope_tables(layers: list, copies: dict):
+    """The bf16 cos and sin tables [positions, 32] both rotaries of every covered
+    layer read, from the first layer's MLA rotary; each indexer's must equal it."""
+    cos, sin = _cos_sin(layers[0].self_attn.rotary_emb)
+    for layer in layers:
+        indexer = layer.self_attn.indexer
+        if indexer is None:
+            continue
+        ic, is_ = _cos_sin(indexer.rotary_emb)
         if ic.shape != cos.shape or not (
             torch.equal(ic, cos) and torch.equal(is_, sin)
         ):

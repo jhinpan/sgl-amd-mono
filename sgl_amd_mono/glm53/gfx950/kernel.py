@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
+# Adapted from ROCm/aiter#6173 at 56d6390def (Apache-2.0):
+# aiter/ops/flydsl/kernels/glm5_mono/glm/kernel.py
 
 """GLM-5 indexed decode MonoKernel: one persistent launch per TP rank.
 
@@ -196,13 +198,13 @@ def build_glm5_monokernel(
     int64 ``[sum(task counts), TL_COLS]`` (start, hint seen, inputs staged, compute
     done, end, then free debug marks) in ``stage_tasks`` order.
 
-    ``index_paged=True`` keeps the index keys in vLLM's paged FP8 cache: per
+    ``index_paged=True`` keeps the index keys in SGLang's paged FP8 cache: per
     block, ``index_block_size x 128`` E4M3 values (``index_shuffled``: 16-token x
     16-byte tiles) followed by one power-of-two f32 scale per token, with blocks
     ``index_block_bytes`` apart.  Every row is its own request: ``req_ids`` picks
-    its ``block_table`` row (``block_table_stride`` entries), keys cover
-    positions ``0 .. positions[s]``, and the top-k is published as global cache
-    slots to ``out_indices`` at the row's ``sparse_kv_indptr`` offset.
+    its ``block_table`` row (rows ``bt_stride`` entries apart, a launch argument),
+    keys cover positions ``0 .. positions[s]``, and the top-k is published as
+    global cache slots to ``out_indices`` at the row's ``sparse_kv_indptr`` offset.
     ``index_k_bf16`` reads the index K projection as packed bf16.
 
     ``dense_experts > 0`` runs a dense MLP instead of the MoE: its intermediate
@@ -2065,7 +2067,7 @@ def build_glm5_monokernel(
                             v0, v1 = v0 * c - v1 * sn, v0 * sn + v1 * c
                         v0, v1 = fwht128(v0, v1)
                         if const_expr(index_paged):
-                            # vLLM's ue8m0 quant: scale = 2^ceil(log2(max(amax, 1e-4) / 448))
+                            # the index cache's ue8m0 quant: scale = 2^ceil(log2(max(amax, 1e-4) / 448))
                             amax = wave_max(fx.max(fmath.absf(v0), fmath.absf(v1)))
                             bits = div_rn(
                                 fx.max(amax, fx.Float32(1.0e-4)),

@@ -5,12 +5,15 @@ requirements, the same way for every spec."""
 
 from types import SimpleNamespace
 
+import pytest
 import torch
+from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.monokernels import spec as registry
 
 import sgl_amd_mono
 from sgl_amd_mono.glm53 import HF_CONFIG
 from sgl_amd_mono.glm53 import spec as glm53
+from sgl_amd_mono.glm53.gfx950.weights import rope_tables
 
 # GLM-5.3's layer structure and quantization (its config.json)
 GLM53 = SimpleNamespace(
@@ -89,25 +92,97 @@ def test_config_reasons_name_each_mismatch():
     assert "FP8 block-128" in text
 
 
-def _layer(experts_dtype=torch.float8_e4m3fn, n_experts=257, indexer=True):
-    w13 = torch.empty(n_experts, 1, 1, dtype=experts_dtype)
+def _linear(shuffled=True):
+    # SGLang marks only the block-FP8 linears it rewrote into AITER's layout
+    if not shuffled:
+        return SimpleNamespace(weight=SimpleNamespace())
     return SimpleNamespace(
-        mlp=SimpleNamespace(experts=SimpleNamespace(w13_weight=w13)),
-        self_attn=SimpleNamespace(indexer=object() if indexer else None),
+        aiter_bpreshuffled=True, weight=SimpleNamespace(is_shuffled=True)
     )
 
 
-def test_model_reasons():
-    def model(layers):
-        return SimpleNamespace(model=SimpleNamespace(layers=layers))
+def _layer(
+    experts_dtype=torch.float8_e4m3fn,
+    n_experts=257,
+    indexer=True,
+    shuffled=True,
+    runner=MoeRunnerBackend.AITER,
+    fused_indexer=True,
+):
+    w13 = torch.empty(n_experts, 1, 1, dtype=experts_dtype)
+    quant = SimpleNamespace(runner=SimpleNamespace(runner_backend=runner))
+    ind = SimpleNamespace(
+        wq_b=_linear(), wk=_linear(), use_gfx950_fused_indexer=fused_indexer
+    )
+    attn = SimpleNamespace(
+        fused_qkv_a_proj_with_mqa=_linear(shuffled),
+        q_b_proj=_linear(),
+        o_proj=_linear(),
+        indexer=ind if indexer else None,
+    )
+    experts = SimpleNamespace(w13_weight=w13, quant_method=quant)
+    return SimpleNamespace(mlp=SimpleNamespace(experts=experts), self_attn=attn)
 
-    good = [_layer(indexer=i % 4 == 2 or i < 3) for i in range(78)]
-    assert glm53._model_disable_reasons(model(good), GLM53, {}) == []
+
+def _model(layers):
+    return SimpleNamespace(model=SimpleNamespace(layers=layers))
+
+
+def _layers():
+    # GLM-5.3's indexers: layers 0 to 2, then every fourth from layer 6
+    return [_layer(indexer=i % 4 == 2 or i < 3) for i in range(78)]
+
+
+def test_model_reasons():
+    good = _layers()
+    assert glm53._model_disable_reasons(_model(good), GLM53, {}) == []
     bad = list(good)
     bad[5] = _layer(experts_dtype=torch.bfloat16)
     bad[9] = _layer(n_experts=256)
     bad[2] = _layer(indexer=False)
-    reasons = " ".join(glm53._model_disable_reasons(model(bad), GLM53, {}))
+    reasons = " ".join(glm53._model_disable_reasons(_model(bad), GLM53, {}))
     assert "layer 5: needs block-FP8 experts" in reasons
     assert "layer 9: needs the shared expert fused" in reasons
     assert "layer 3 reuses the top-k of layer 2" in reasons
+
+
+def test_model_reasons_name_the_layouts_the_kernel_cannot_read():
+    # These served wrong tokens without a refusal: the kernel read row-major FP8
+    # projections (--fp8-gemm-backend triton) and experts off the AITER MoE
+    # runner as (16, 16) tiles, and scored rotated index queries against keys that
+    # an indexer other than SGLang's gfx950 fused one caches unrotated
+    layers = _layers()
+    layers[4] = _layer(indexer=False, shuffled=False)
+    layers[5] = _layer(indexer=False, shuffled=False)
+    layers[7] = _layer(indexer=False, runner=MoeRunnerBackend.TRITON)
+    layers[10] = _layer(fused_indexer=False)
+    reasons = glm53._model_disable_reasons(_model(layers), GLM53, {})
+    assert [r.split(":")[0] for r in reasons] == [
+        "layer 7",
+        "fused_qkv_a_proj_with_mqa of 2 layers from 4",
+        "the indexer of layer 10",
+    ], reasons
+    assert "AITER MoE runner" in reasons[0] and "(16, 16)" in reasons[1]
+    assert "gfx950 fused DSA indexer" in reasons[2]
+
+
+def test_every_indexer_rotary_must_equal_the_mla_one():
+    # The first covered layer reuses layer 2's top-k and has no indexer, so an
+    # indexer rotary unlike the MLA one went unchecked
+    table = torch.randn(16, 64)
+
+    def layer(indexer_table=None):
+        rotary = SimpleNamespace(cos_sin_cache=table)
+        indexer = None
+        if indexer_table is not None:
+            indexer = SimpleNamespace(
+                rotary_emb=SimpleNamespace(cos_sin_cache=indexer_table)
+            )
+        return SimpleNamespace(
+            self_attn=SimpleNamespace(rotary_emb=rotary, indexer=indexer)
+        )
+
+    cos, _ = rope_tables([layer(), layer(table.clone())], {})
+    assert torch.equal(cos, table[:, :32].to(torch.bfloat16))
+    with pytest.raises(ValueError, match="indexer's rotary"):
+        rope_tables([layer(), layer(table + 1)], {})

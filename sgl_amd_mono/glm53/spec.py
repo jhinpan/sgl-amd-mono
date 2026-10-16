@@ -60,6 +60,7 @@ def _width(rows: int) -> int:
 SGLANG_READS = {
     "srt/arg_groups/fields/*.py": ("page_size",),
     "srt/configs/model_config.py": ("context_len",),
+    "srt/layers/attention/dsa/dsa_indexer.py": ("use_gfx950_fused_indexer",),
     "srt/layers/attention/dsa_backend.py": ("forward_metadata", "real_page_table"),
     "srt/layers/layer_boundary/__init__.py": ("get_attn_tp_context",),
     "srt/layers/layer_boundary/adapters/attention.py": ("maybe_input_scattered",),
@@ -153,16 +154,40 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     return reasons
 
 
+def _where(ids: list) -> str:
+    return f"layer {ids[0]}" if len(ids) == 1 else f"{len(ids)} layers from {ids[0]}"
+
+
 def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
-    from sgl_amd_mono.glm53.gfx950.weights import experts_reason
+    from sgl_amd_mono.glm53.gfx950.weights import (
+        experts_reason,
+        unshuffled_projections,
+    )
 
     reasons = []
     covered = _covered_layers(hf_config)
+    row_major, unrotated = {}, []
     for i in covered:
         layer = model.model.layers[i]
         why = experts_reason(layer.mlp)
         if why is not None:
             reasons.append(f"layer {i}: {why}")
+        for name in unshuffled_projections(layer):
+            row_major.setdefault(name, []).append(i)
+        indexer = layer.self_attn.indexer
+        if indexer is not None and not indexer.use_gfx950_fused_indexer:
+            unrotated.append(i)
+    reasons += [
+        f"{name} of {_where(ids)}: needs AITER's (16, 16) FP8 layout, which SGLang "
+        "applies for its AITER block-FP8 GEMM"
+        for name, ids in row_major.items()
+    ]
+    if unrotated:
+        # the kernel caches and scores Hadamard-rotated index keys
+        reasons.append(
+            f"the indexer of {_where(unrotated)}: needs SGLang's gfx950 fused DSA "
+            "indexer, which caches rotated index keys"
+        )
     first = model.model.layers[covered[0]]
     prev = model.model.layers[covered[0] - 1]
     if first.self_attn.indexer is None and prev.self_attn.indexer is None:
@@ -195,6 +220,7 @@ class _Built:
         self._layers, self.runtimes = layers, runtimes
         self.first, self.last = min(layers), max(layers)
         self.max_rows = TP_MAX_ROWS.get(tp, max(WIDTHS))
+        self.check_layers = os.environ.get("SGLANG_AMD_MONO_CHECK") == "1"
         self.cos, self.sin = cos, sin
         self.keys = torch.arange(TOPK, dtype=torch.int64, device=device)
         self.steps, self.pad_h = {}, {}
@@ -253,7 +279,7 @@ class _Built:
             device=hidden.device,
         )
         gemm_zero = None
-        if getattr(m, "gemm_output_zero_allocator_size", 0) > 0:
+        if m.gemm_output_zero_allocator_size > 0:
             gemm_zero = BumpAllocator(
                 buffer_size=m.gemm_output_zero_allocator_size,
                 dtype=torch.float32,
@@ -309,10 +335,7 @@ class _Built:
         else:
             h = hidden
         self._bind(L)
-        checking = (
-            os.environ.get("SGLANG_AMD_MONO_CHECK") == "1"
-            and not torch.cuda.is_current_stream_capturing()
-        )
+        checking = self.check_layers and not torch.cuda.is_current_stream_capturing()
         if checking:
             from sgl_amd_mono.glm53 import check
 
@@ -435,7 +458,7 @@ def _build(model, hf_config, ctx) -> _Built:
         )
         for i in covered
     }
-    cos, sin = rope_tables(model.model.layers[covered[0]], copies)
+    cos, sin = rope_tables([model.model.layers[i] for i in covered], copies)
     shuffled = {L.w.shuffled for L in layers.values()}
     if len(shuffled) != 1:
         raise ValueError("GLM-5.3 monokernel: the layers' FP8 layouts differ")

@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
+# Adapted from ROCm/aiter#6173 at 56d6390def (Apache-2.0):
+# aiter/ops/flydsl/kernels/glm5_mono/config.py
 
 """Shared model geometry, arithmetic formats, and storage-layout contracts."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
 from enum import Enum
+
+import msgspec
 
 
 class MoeMode(str, Enum):
@@ -69,8 +72,7 @@ class KvCacheLayout(str, Enum):
     ATOM = "atom"
 
 
-@dataclass(frozen=True)
-class MoeFormat:
+class MoeFormat(msgspec.Struct, frozen=True):
     activation: ExpertActivation
     weight: ExpertWeight
 
@@ -139,8 +141,7 @@ def as_kv_cache_layout(value: KvCacheLayout | str) -> KvCacheLayout:
     return _as_layout(value, KvCacheLayout, "KV-cache layout")
 
 
-@dataclass(frozen=True)
-class LayerConfig:
+class LayerConfig(msgspec.Struct, frozen=True):
     """Compile-time geometry and attention semantics for one TP decode shard."""
 
     name: str
@@ -210,7 +211,7 @@ def glm5_tp_config(tp_size: int) -> LayerConfig:
         raise ValueError(
             f"GLM-5 tensor parallel size must be one of {GLM5_TP_SIZES}, got {tp_size}"
         )
-    return replace(
+    return msgspec.structs.replace(
         GLM5_CONFIG,
         local_heads=GLM5_GLOBAL_HEADS // tp_size,
         inter=GLM5_GLOBAL_INTER // tp_size,

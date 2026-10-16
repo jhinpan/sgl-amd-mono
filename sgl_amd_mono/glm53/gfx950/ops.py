@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
+# Adapted from ROCm/aiter#6173 at 56d6390def (Apache-2.0):
+# aiter/ops/flydsl/kernels/glm5_mono/ops.py
 
 """Common AMD expression primitives for fused model-layer kernels."""
 
