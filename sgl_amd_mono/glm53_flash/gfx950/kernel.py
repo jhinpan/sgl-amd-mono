@@ -180,7 +180,7 @@ class FlashBuild(msgspec.Struct, frozen=True):
     qkv_shuffled: bool = False
     qb_shuffled: bool = False
     o_shuffled: bool = False
-    # SGLANG_TEST_MONO_FAULT_INJECT: the wait this rank stalls at (0: none), once
+    # SGLANG_AMD_MONO_FAULT_INJECT: the wait this rank stalls at (0: none), once
     # fault_after steps have run
     fault_site: int = 0
     fault_after: int = 0

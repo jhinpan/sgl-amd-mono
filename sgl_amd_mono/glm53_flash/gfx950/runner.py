@@ -242,8 +242,8 @@ class FlashLayerOp:
             kda,
             dsa,
         )
-        # the layer's argument table (``DSA_TAB`` order), refreshed when a cache or
-        # the page table moves; under capture by per-entry fills
+        # the layer's argument table (``DSA_TAB`` order), rewritten outside capture
+        # when a cache moves; the page table is a launch argument
         self.tab: Optional[torch.Tensor] = None
         self._tab_host: list[int] = []
         if dsa is not None:
