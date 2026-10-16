@@ -118,7 +118,6 @@ NUMERICS = Numerics(
         "layer.streams.cosine": 0.95,
         "layer.kv.cosine": 0.995,
         "layer.index.cosine": 0.999,
-        "layer.index_scale.rel": 0.01,
     },
 )
 

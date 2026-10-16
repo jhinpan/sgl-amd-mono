@@ -47,21 +47,23 @@ def _metrics(a: torch.Tensor, b: torch.Tensor) -> dict[str, float]:
     }
 
 
+def _index_keys(page: torch.Tensor):
+    """An index page's keys as scored (FP8 values times their token's power-of-two
+    scale) and its scales. A value byte b of the 16 x 16 tiles is token
+    (b // 2048) * 16 + (b % 256) // 16."""
+    b = torch.arange(INDEX_VALUE_BYTES, device=page.device)
+    token = (b // 2048) * 16 + (b % 256) // 16
+    values = page[:, :INDEX_VALUE_BYTES].contiguous().view(torch.float8_e4m3fn).float()
+    scales = page[:, INDEX_VALUE_BYTES:].contiguous().view(torch.float32)
+    return values * scales[:, token], scales
+
+
 def _outputs(name: str, a: torch.Tensor, b: torch.Tensor) -> dict[str, dict]:
     if name != "index":
         return {name: _metrics(a, b)}
-    # both pages in one layout: compare the decoded FP8 values and the f32 scales
-    fp8 = torch.float8_e4m3fn
-    return {
-        "index": _metrics(
-            a[:, :INDEX_VALUE_BYTES].contiguous().view(fp8),
-            b[:, :INDEX_VALUE_BYTES].contiguous().view(fp8),
-        ),
-        "index_scale": _metrics(
-            a[:, INDEX_VALUE_BYTES:].contiguous().view(torch.float32),
-            b[:, INDEX_VALUE_BYTES:].contiguous().view(torch.float32),
-        ),
-    }
+    # a key whose amax sits at a power of two may take the other scale and values
+    (ka, sa), (kb, sb) = _index_keys(a), _index_keys(b)
+    return {"index": _metrics(ka, kb), "index_scale": _metrics(sa, sb)}
 
 
 def _regions(L, forward_batch, S: int) -> dict:
