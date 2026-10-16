@@ -65,7 +65,7 @@ def _width(rows: int) -> int:
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
-    "srt/arg_groups/fields/*.py": ("page_size",),
+    "srt/arg_groups/fields/*.py": ("page_size", "enable_linear_replayssm"),
     "srt/configs/glm5_next.py": (
         "num_hidden_layers",
         "first_k_dense_replace",
@@ -287,6 +287,7 @@ class _Built:
         self._layers, self.runtimes = layers, runtimes
         self.first, self.last = min(layers), max(layers)
         self.max_rows = TP_MAX_ROWS.get(tp, max(WIDTHS))
+        self.check_layers = os.environ.get("SGLANG_AMD_MONO_CHECK") == "1"
         # the first covered layer's identity mix: the written streams pass unchanged
         n = max(WIDTHS)
         self.zero_x = torch.zeros(n, HIDDEN, dtype=torch.bfloat16, device=device)
@@ -390,10 +391,7 @@ class _Built:
 
         S = plan.key.rows
         W = _width(S)
-        checking = (
-            os.environ.get("SGLANG_AMD_MONO_CHECK") == "1"
-            and not torch.cuda.is_current_stream_capturing()
-        )
+        checking = self.check_layers and not torch.cuda.is_current_stream_capturing()
         if L.i == self.first:
             streams = take_output(hidden_states, forward_batch)
             res = streams.view(S, self.eye_comb.shape[1], -1)
@@ -683,6 +681,8 @@ SPEC = MonoSpec(
         server_args={
             "kv_cache_dtype": frozenset({"auto", "bfloat16"}),
             "moe_runner_backend": frozenset({"auto", "aiter"}),
+            # the launch updates the KDA state in place; ReplaySSM defers it to a ring
+            "enable_linear_replayssm": frozenset({False}),
         },
     ),
     numerics=NUMERICS,
