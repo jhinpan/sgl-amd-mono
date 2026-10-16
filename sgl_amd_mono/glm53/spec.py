@@ -44,6 +44,9 @@ from sgl_amd_mono.glm53 import HF_CONFIG
 WIDTHS = (2, 4, 8)
 ROWS = tuple(range(1, max(WIDTHS) + 1))
 TP_SIZES = (4, 8)
+# the rows a step runs on the kernels at most at this TP size: on MI355X an 8-row
+# launch at TP4 is slower than the model's forward, so wider steps run that
+TP_MAX_ROWS = {4: 4}
 # SGLang's DSA cache on ROCm: 64-token pages
 PAGE_SIZE = 64
 TOPK = 2048
@@ -184,13 +187,14 @@ class _Built:
     """One rank's monokernels: the runtimes per (width, kind), each covered layer's
     ops, the step's rows per width, and the forward."""
 
-    def __init__(self, lm, layers: dict, runtimes: dict, cos, sin, device):
+    def __init__(self, lm, layers: dict, runtimes: dict, cos, sin, tp: int, device):
         from sgl_amd_mono.glm53.gfx950.config import HIDDEN
         from sgl_amd_mono.glm53.gfx950.runner import Glm53Step
 
         self.lm, self.model = lm, lm.model
         self._layers, self.runtimes = layers, runtimes
         self.first, self.last = min(layers), max(layers)
+        self.max_rows = TP_MAX_ROWS.get(tp, max(WIDTHS))
         self.cos, self.sin = cos, sin
         self.keys = torch.arange(TOPK, dtype=torch.int64, device=device)
         self.steps, self.pad_h = {}, {}
@@ -217,9 +221,13 @@ class _Built:
         pp_proxy_tensors=None,
     ):
         """``DeepseekV2ForCausalLM.forward`` for a routed decode step."""
+        lm = self.lm
+        if plan.key.rows > self.max_rows:
+            return type(lm).forward(
+                lm, input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+            )
         from sglang.srt.layers.layer_boundary import get_attn_tp_context
 
-        lm = self.lm
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden = self._backbone(
                 plan, input_ids, positions, forward_batch, input_embeds
@@ -440,7 +448,8 @@ def _build(model, hf_config, ctx) -> _Built:
     # the keys an indexer row scores at most: the served context's, in whole tasks
     step_keys = INDEX_KEYS_PER_TASK
     max_seq = -(-process_model_config().context_len // step_keys) * step_keys
-    widths = sorted({_width(r) for r in ctx.widths})
+    cap = TP_MAX_ROWS.get(tp, max(WIDTHS))
+    widths = sorted({_width(r) for r in ctx.widths if r <= cap})
     runtimes = {}
     # each runtime's peer handshake is collective: every rank builds them in one order
     for w in widths:
@@ -467,7 +476,7 @@ def _build(model, hf_config, ctx) -> _Built:
     for w in widths[start:] + widths[:start]:
         for kind in kinds:
             runtimes[w, kind].precompile()
-    return _Built(model, layers, runtimes, cos, sin, device)
+    return _Built(model, layers, runtimes, cos, sin, tp, device)
 
 
 SPEC = MonoSpec(

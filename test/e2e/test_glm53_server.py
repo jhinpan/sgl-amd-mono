@@ -141,7 +141,9 @@ class TestMonokernelCheck(CustomTestCase):
         seen = {(kind, int(rows)) for kind, rows, _, _ in checks}
         want = {(kind, rows) for kind in ("indexer", "shared") for rows in (1, 3, 8)}
         self.assertTrue(want <= seen, seen)
-        self.assertTrue(any(k == "indexer" and int(hi) >= 2048 for k, _, hi, _ in checks))
+        self.assertTrue(
+            any(k == "indexer" and int(hi) >= 2048 for k, _, hi, _ in checks)
+        )
         violations = re.findall(r"monokernel check violation: .*", log)
         self.assertEqual(violations, [], "\n".join(violations[:20]))
 
