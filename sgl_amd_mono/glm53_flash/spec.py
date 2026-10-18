@@ -74,6 +74,7 @@ SGLANG_READS = {
     ),
     "srt/configs/mamba_utils.py": ("mamba2_state_dtype",),
     "srt/configs/model_config.py": ("context_len",),
+    "srt/distributed/parallel_state.py": ("cpu_group",),
     "srt/layers/attention/dsa/utils.py": ("aiter_can_use_preshuffle_paged_mqa",),
     "srt/layers/attention/dsa_backend.py": ("forward_metadata", "real_page_table"),
     "srt/layers/attention/hybrid_linear_attn_backend.py": (
@@ -101,6 +102,7 @@ SGLANG_READS = {
     "srt/model_executor/forward_batch_info.py": (
         "out_cache_loc",
         "req_pool_indices",
+        "forward_mode",
         "is_idle",
     ),
     "srt/model_executor/forward_context.py": (
@@ -113,6 +115,8 @@ SGLANG_READS = {
         "model",
         "embed_tokens",
         "layers",
+        "input_layernorm",
+        "do_fuse_qkvbfg",
         "start_layer",
         "end_layer",
         "gemm_output_zero_allocator_size",
@@ -132,6 +136,9 @@ SGLANG_READS = {
         "Numerics",
         "NumericsKind",
         "Requirements",
+        "widths",
+        "deadline_s",
+        "copies",
     ),
     "srt/runtime_context.py": (
         "get_parallel",

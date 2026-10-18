@@ -46,6 +46,11 @@ SGLANG_READS = {
         "dt_bias",
         "o_norm",
         "num_fused_shared_experts",
+        "self_attn",
+        "mlp",
+        "input_layernorm",
+        "post_attention_layernorm",
+        "o_proj",
     ),
     "srt/models/deepseek_v2.py": (
         "fused_qkv_a_proj_with_mqa",
@@ -54,7 +59,12 @@ SGLANG_READS = {
         "q_b_proj",
         "kv_b_proj",
         "shared_experts",
+        "gate_up_proj",
+        "down_proj",
+        "gate",
+        "experts",
         "e_score_correction_bias",
+        "indexer",
     ),
     "srt/layers/attention/dsa/dsa_indexer.py": ("wk", "wq_b", "weights_proj"),
     "srt/layers/attention/dsa/dsa_indexer_kpool.py": (
@@ -70,7 +80,9 @@ SGLANG_READS = {
     "srt/layers/quantization/fp8_hip.py": ("mxfp8_native_ready",),
     "srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4_moe.py": (
         "is_shuffled",
+        "w13_weight",
         "w13_weight_scale",
+        "w2_weight",
         "w2_weight_scale",
     ),
 }
