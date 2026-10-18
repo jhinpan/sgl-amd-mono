@@ -56,6 +56,7 @@ from sglang.srt.monokernels.spec import (
     Numerics,
     NumericsKind,
     Requirements,
+    StepMetadata,
 )
 
 from sgl_amd_mono.common.plan import BLOCKS
@@ -84,7 +85,9 @@ SGLANG_READS = {
         "Numerics",
         "NumericsKind",
         "Requirements",
+        "StepMetadata",
         "tokens_per_request",
+        "unread_metadata",
     ),
     # an index source whose rows SGLang's decode indexer does not score
     "kernels/ops/attention/dsv4/__init__.py": ("topk_transform_paged",),
@@ -801,11 +804,6 @@ class _Built:
         self.lm, self.model, self.runner, self._layers = lm, lm.model, runner, layers
         self._normal_moe = lm.model.layers[min(layers)].mlp
 
-    def skips_metadata(self, name, forward_batch, key, source) -> bool:
-        """A routed step scores every index source with K2i (``_select``): SGLang's
-        aiter decode schedule of a ratio is never read."""
-        return name == "low_ratio_decode_schedule"
-
     def forward(
         self, plan, input_ids, positions, forward_batch, input_embeds=None, *_, **__
     ):
@@ -998,4 +996,6 @@ SPEC = MonoSpec(
     api_version=1,  # sglang.srt.monokernels.spec.MONOKERNEL_API_VERSION
     config_disable_reasons=_config_disable_reasons,
     load_tensor=_load_tensor,
+    # a routed step scores every index source with K2i (_select)
+    unread_metadata=frozenset({StepMetadata.LOW_RATIO_DECODE_SCHEDULE}),
 )
