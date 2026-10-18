@@ -74,6 +74,7 @@ SGLANG_READS = {
     ),
     "srt/configs/mamba_utils.py": ("mamba2_state_dtype",),
     "srt/configs/model_config.py": ("context_len",),
+    "srt/layers/attention/dsa/utils.py": ("aiter_can_use_preshuffle_paged_mqa",),
     "srt/layers/attention/dsa_backend.py": ("forward_metadata", "real_page_table"),
     "srt/layers/attention/hybrid_linear_attn_backend.py": (
         "full_attn_backend",
@@ -179,6 +180,9 @@ def _covered_layers(config) -> list[int]:
 
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     from sglang.srt.configs.mamba_utils import mamba2_state_dtype
+    from sglang.srt.layers.attention.dsa.utils import (
+        aiter_can_use_preshuffle_paged_mqa,
+    )
 
     text = _text(hf_config)
     reasons = [
@@ -207,6 +211,11 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     if cfg.page_size not in (None, PAGE_SIZE):
         reasons.append(
             f"--page-size {cfg.page_size}: the kpool caches need {PAGE_SIZE}"
+        )
+    if not aiter_can_use_preshuffle_paged_mqa():
+        reasons.append(
+            "needs the index cache in AITER's preshuffled layout, which the kernels "
+            "write; without AITER's preshuffle paged MQA, SGLang keeps it row-major"
         )
     quant = (getattr(hf_config, "quantization_config", None) or {}).get("quant_method")
     if quant != "quark":

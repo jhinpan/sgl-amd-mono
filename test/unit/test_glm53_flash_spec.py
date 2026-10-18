@@ -88,8 +88,10 @@ def _dtypes(temporal=torch.float32, conv=torch.bfloat16):
 
 def test_config_reasons_name_each_mismatch(monkeypatch):
     import sglang.srt.configs.mamba_utils as mamba_utils
+    import sglang.srt.layers.attention.dsa.utils as dsa_utils
 
     monkeypatch.setattr(mamba_utils, "mamba2_state_dtype", _dtypes())
+    monkeypatch.setattr(dsa_utils, "aiter_can_use_preshuffle_paged_mqa", lambda: True)
     assert flash.SPEC.config_disable_reasons(_cfg(), FLASH) == []
     # the last KDA layer (42 here) covered: its normal path tracks every layer's state
     kda = [i for i in TEXT.linear_attn_config["kda_layers"] if i < 44]
@@ -107,6 +109,8 @@ def test_config_reasons_name_each_mismatch(monkeypatch):
     monkeypatch.setattr(
         mamba_utils, "mamba2_state_dtype", _dtypes(temporal=torch.bfloat16)
     )
+    # SGLang's k-pool writer keeps the index cache row-major; the kernels write tiles
+    monkeypatch.setattr(dsa_utils, "aiter_can_use_preshuffle_paged_mqa", lambda: False)
     other = SimpleNamespace(
         text_config=text,
         architectures=FLASH.architectures,
@@ -120,10 +124,11 @@ def test_config_reasons_name_each_mismatch(monkeypatch):
         "layer 42: the last KDA layer",
         "KDA state in f32",
         "--page-size 64",
+        "preshuffled layout",
         "Quark checkpoint",
     ):
         assert want in joined, joined
-    assert len(reasons) == 6, reasons
+    assert len(reasons) == 7, reasons
 
 
 def _layer(kda=True, shuffled=True, scale_dims=3, fused=True, indexer=True):
