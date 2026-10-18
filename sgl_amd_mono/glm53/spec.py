@@ -58,7 +58,16 @@ def _width(rows: int) -> int:
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
-    "srt/arg_groups/fields/*.py": ("page_size",),
+    "srt/arg_groups/fields/*.py": (
+        "page_size",
+        "enable_hisparse",
+        "expert_distribution_recorder_mode",
+    ),
+    "srt/environ.py": (
+        "SGLANG_DSA_FUSE_TOPK",
+        "SGLANG_SIMULATE_UNIFORM_EXPERTS",
+        "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS",
+    ),
     "srt/configs/model_config.py": ("context_len",),
     "srt/layers/attention/dsa/dsa_indexer.py": ("use_gfx950_fused_indexer",),
     "srt/layers/attention/dsa_backend.py": ("forward_metadata", "real_page_table"),
@@ -514,6 +523,17 @@ SPEC = MonoSpec(
         server_args={
             "kv_cache_dtype": frozenset({"auto", "bfloat16"}),
             "moe_runner_backend": frozenset({"auto", "aiter"}),
+            # HiSparse maps the logical KV slots to device rows; the kernels write raw slots
+            "enable_hisparse": frozenset({False}),
+            # the launches record no expert distribution (SGLang's forward sets it per layer)
+            "expert_distribution_recorder_mode": frozenset({None}),
+        },
+        env={
+            # layer 3 reads layer 2's top-k as KV slots; unfused top-k hands out positions
+            "SGLANG_DSA_FUSE_TOPK": True,
+            # benchmark routing overrides: the kernels route with the model's own router
+            "SGLANG_SIMULATE_UNIFORM_EXPERTS": False,
+            "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS": False,
         },
     ),
     numerics=NUMERICS,
