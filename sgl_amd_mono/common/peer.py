@@ -19,7 +19,7 @@ _IPC_MEM_LAZY_ENABLE_PEER_ACCESS = 0x1
 _DEVICE_MALLOC_UNCACHED = 0x3
 # A peer maps an IPC handle in 2 MiB granules: bytes past the last whole granule of
 # the exporter's allocation fault on the peer, so allocate whole granules.
-_PAGE = 2 << 20
+_GRANULE = 2 << 20
 
 
 class PeerMemoryError(RuntimeError):
@@ -71,7 +71,7 @@ def _check(err: int, what: str) -> None:
 
 
 def _alloc_uncached(nbytes: int) -> int:
-    size = -(-nbytes // _PAGE) * _PAGE
+    size = -(-nbytes // _GRANULE) * _GRANULE
     ptr = ctypes.c_void_p()
     _check(
         _hip().hipExtMallocWithFlags(ctypes.byref(ptr), size, _DEVICE_MALLOC_UNCACHED),
