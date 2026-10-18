@@ -9,8 +9,9 @@
 
 """GLM-5.3-Flash decoder-layer monokernel: one persistent launch per TP rank.
 
-``grid = 256 CTAs x 512 threads`` (one CTA per MI355X CU) runs one MoE layer's
-FFN for this rank's TP shard, after the layer's attention::
+``grid = 256 CTAs x 512 threads`` (one CTA per MI355X CU) runs one MoE layer
+for this rank's TP shard: with ``kda`` or ``dsa`` its attention first
+(``build_flash_kernel``), then its FFN::
 
     seam: TP sum of the attention partials -> mHC post -> R' + mix partials
       -> gate: mixes -> pre / post / comb (Sinkhorn) -> RMSNorm'd FFN input row
@@ -894,7 +895,7 @@ def build_flash_kernel(key: FlashBuild):
             MIX_A = HC_MULT * (1 + HC_MULT)
 
             def run_seam(stage, mode):
-                """``mode``: "ffn" (vLLM's attention partials), "attn" (the previous
+                """``mode``: "ffn" (the caller's attention partials), "attn" (the previous
                 layer's output, attention-side mHC) or "ffn_own" (this launch's o_proj
                 partials, R / post / comb from its attention-side mHC)."""
                 r_attn = _rsrc(attn_part)

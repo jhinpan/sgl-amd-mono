@@ -21,7 +21,7 @@ keep the normal path. A KDA pad row (state index not positive) keeps every state
 a sparse-attention pad row (SGLang's padding slot 0) writes no cache.
 
 The kernels read SGLang's weights in place, except the copies logged at startup:
-the router packed for the MFMA tiles, W_UK^T from kv_b_proj, the indexer's
+the router packed for the MFMA tiles and its bias in f32, W_UK^T from kv_b_proj, the indexer's
 wk | weights_proj in bf16, the o_norm weight in f32, and the shared expert packed
 as one AITER expert where SGLang keeps it apart (TP2).
 """

@@ -3,8 +3,8 @@
 # Adapted from vllm-project/vllm at ca328e297b (Apache-2.0):
 # vllm/models/glm5next/amd/mono/weights.py
 """One GLM-5.3-Flash MoE layer's tensors as the launch reads them: views of
-SGLang's loaded parameters, except the copies each function names (the caller
-records them in ``copies`` so attach logs their sizes)."""
+SGLang's loaded parameters, except the copies each function names (each records
+them in ``copies``, so attach logs their sizes)."""
 
 from __future__ import annotations
 
@@ -159,8 +159,8 @@ def _shared_expert(layer, idx: int, inter: int, copies: dict):
 
 
 def layer_weights(layer, idx: int, inter: int, copies: dict):
-    """The MoE side: the routed experts as stored, the router packed once, and the
-    shared expert as the fused expert slot or a packed copy."""
+    """The MoE side: the routed experts as stored, the router packed once and its
+    bias in f32, and the shared expert as the fused expert slot or a packed copy."""
     from .packing import pack_bf16
     from .runner import FlashFfnWeights
 
