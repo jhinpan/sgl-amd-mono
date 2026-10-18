@@ -63,6 +63,7 @@ SGLANG_READS = {
         "enable_hisparse",
         "expert_distribution_recorder_mode",
     ),
+    "srt/distributed/parallel_state.py": ("cpu_group",),
     "srt/environ.py": (
         "SGLANG_DSA_FUSE_TOPK",
         "SGLANG_SIMULATE_UNIFORM_EXPERTS",
@@ -85,6 +86,7 @@ SGLANG_READS = {
     "srt/model_executor/forward_batch_info.py": (
         "out_cache_loc",
         "seq_lens",
+        "forward_mode",
         "is_idle",
     ),
     "srt/model_executor/forward_context.py": (
@@ -99,6 +101,7 @@ SGLANG_READS = {
         "end_layer",
         "norm",
         "self_attn",
+        "input_layernorm",
         "indexer",
         "gemm_output_zero_allocator_size",
         "next_full_attention_layer_id",
@@ -112,6 +115,9 @@ SGLANG_READS = {
         "Numerics",
         "NumericsKind",
         "Requirements",
+        "widths",
+        "deadline_s",
+        "copies",
     ),
     "srt/runtime_context.py": (
         "get_parallel",
