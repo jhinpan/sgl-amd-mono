@@ -657,6 +657,11 @@ def _build(model, hf_config, ctx) -> _Built:
     runtimes = {}
     cap = TP_MAX_ROWS.get(tp, max(WIDTHS))
     widths = sorted({_width(r) for r in ctx.widths if r <= cap})
+    if not widths:
+        raise ValueError(
+            f"GLM-5.3-Flash monokernel: TP{tp} runs at most {cap} rows on the kernels, "
+            f"and this server's decode graphs route {sorted(ctx.widths)}"
+        )
     # each runtime's peer handshake is collective: every rank builds them in one order
     for w in widths:
         for kind, ids in kinds.items():
