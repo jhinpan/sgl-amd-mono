@@ -12,7 +12,7 @@ prepared sparse indices::
 
     input RMSNorm -> q_a / kv_a projection -> q_a RMSNorm -> q_b (+RoPE)
       -> KV RMSNorm / k_pe RoPE -> KV/PE cache publish
-      -> index K/Q/W projection -> index K norm/RoPE/cache
+      -> index K/Q/W projection -> index K norm/RoPE/Hadamard/cache
       -> index score -> exact radix top-2048
       -> absorbed q (W_UK) -> sparse MLA split softmax -> merge -> W_UV -> W_o
       -> attention TP peer reduce + residual                      (sym_attn)
@@ -33,7 +33,8 @@ consumer polls the payload itself until the tags match, so a hand-off costs
 one memory round trip: no store drain, no separate flag, no second load.
 
 GEMVs run on the matrix cores: weights are host-packed (``pack_fp8`` /
-``pack_bf16``) so one wave loads 16 rows x 64 k as one contiguous 1 KB, FP8 is
+``pack_bf16``) or, with ``fp8_shuffled``, read in place in AITER's (16, 16)
+layout, so one wave loads 16 rows x 64 k as one contiguous 1 KB, FP8 is
 widened exactly to bf16 and fed to ``mfma_f32_16x16x32_bf16`` with the samples
 as the N dimension.  Each 64-k chunk's partial is scaled by its f32 block
 scale (times any activation scale / route weight) into the accumulator, so the
@@ -43,9 +44,6 @@ depend on upstream results are issued before the task waits for its inputs.
 Cross-GPU: each rank pushes its partial rows as tagged pairs into every peer's
 symmetric buffer and polls its own; every rank sums the TP partials in rank
 order, so all ranks produce bit-identical hidden states (and routing).
-
-TileRT shared/reuse MonoKernel reference (fusion-boundary comparison):
-https://github.com/SemiAnalysisAI/InferenceX/tree/8ac98344b038a3f2da20a565fe9b974772a67ef9
 """
 
 import flydsl.compiler as flyc
@@ -296,8 +294,7 @@ def build_glm5_monokernel(
         S * MOE_SLOTS,
     )
 
-    # TileRT lineage: use one phase-overlaid arena instead of summing every
-    # stage's LDS requirement.  The Kimi kernel reuses this same fusion pattern.
+    # one phase-overlaid LDS arena, not the sum of every stage's needs.
     # The largest X users are the four-sample input projection, all-sample MoE FP8
     # activations, and sparse attention.  Metadata, reductions, and outputs live
     # after that common X region because they are simultaneously live in GEMVs.
@@ -582,8 +579,8 @@ def build_glm5_monokernel(
             """Load one uniform pointer from the compact indexer parameter table.
 
             Fused-indexer launches carry this table in the otherwise independent
-            timeline argument, keeping the no-indexer kernel ABI identical to the
-            original layer.  The indices argument similarly carries index_cache.
+            timeline argument, so both kinds share one signature.  The indices
+            argument similarly carries index_cache.
             """
             pv = fx.Vector(
                 bo.buffer_load(_rsrc(timeline_buf), i * 2, vec_width=2, dtype=T.i32)
@@ -593,8 +590,6 @@ def build_glm5_monokernel(
             )
 
         # ---- tagged-pair mailboxes
-        # TileRT lineage: payload + launch epoch is the progress protocol for
-        # resident CTAs; the helpers below are the FlyDSL/ROCm adaptation.
         def mb(name):
             return scratch + fx.Int64(SC[name])
 

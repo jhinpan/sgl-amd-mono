@@ -55,7 +55,7 @@ class Glm53Build(msgspec.Struct, frozen=True):
 
 class Glm53Weights(msgspec.Struct, frozen=True):
     """One layer's tensors as the kernel reads them. Every FP8 weight carries f32
-    128 x 128 block scales. q_a | kv_a, q_b, o_proj, the indexer's wq_b and wk and
+    block scales, 128 x 128 (W_UK's 128 x 64). q_a | kv_a, q_b, o_proj, the indexer's wq_b and wk and
     the experts are SGLang's tensors (``Glm53Build.fp8_shuffled``); W_UK, W_UV,
     the router and the indexer's weights_proj are packed copies, the k LayerNorm
     weight and bias f32 copies. ``index``: an indexer layer's pointer table."""
@@ -95,7 +95,7 @@ class Glm53Caches(msgspec.Struct, frozen=True):
 
 
 class Glm53Step(msgspec.Struct, frozen=True):
-    """A step's rows for every launch of one width (``Glm53Built`` fills them):
+    """A step's rows for every launch of one width (the spec's ``_Built._step`` fills them):
     int64 positions and MLA slots (-1: a pad row), int32 ``indptr`` [W + 1] (row
     s attends keys indptr[s] ..< indptr[s + 1]), int32 request rows of
     ``page_table`` (SGLang's int32 64-token page table), and the int32 top-k
