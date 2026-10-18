@@ -144,7 +144,7 @@ def _mxfp4_rows(name: str, linear, rows: int, k: int):
     return w.view(torch.uint8).contiguous(), sc.view(torch.uint8).contiguous()
 
 
-def _shared_expert(layer, idx: int, inter: int, copies: dict):
+def _shared_expert(layer, i: int, inter: int, copies: dict):
     """The shared expert of an unfused layer (SGLang fuses it only at TP4 and TP8),
     packed once as one expert of AITER's MoE layout."""
     from .packing import pack_shared_expert
@@ -154,11 +154,11 @@ def _shared_expert(layer, idx: int, inter: int, copies: dict):
     down = _mxfp4_rows("down_proj", shared.down_proj, HIDDEN, inter)
     packed = pack_shared_expert(*gate_up, *down)
     for name, t in zip(("w_ug", "s_ug", "w_dn", "s_dn"), packed):
-        copies["shared expert packed", idx, name] = t
+        copies["shared expert packed", i, name] = t
     return packed
 
 
-def layer_weights(layer, idx: int, inter: int, copies: dict):
+def layer_weights(layer, i: int, inter: int, copies: dict):
     """The MoE side: the routed experts as stored, the router packed once and its
     bias in f32, and the shared expert as the fused expert slot or a packed copy."""
     from .packing import pack_bf16
@@ -179,7 +179,7 @@ def layer_weights(layer, idx: int, inter: int, copies: dict):
     if fused:
         shared = (w_ug[N_EXPERTS], s_ug[N_EXPERTS], w_dn[N_EXPERTS], s_dn[N_EXPERTS])
     else:
-        shared = _shared_expert(layer, idx, inter, copies)
+        shared = _shared_expert(layer, i, inter, copies)
     gate = _need(
         "gate.weight",
         mlp.gate.weight,
@@ -190,7 +190,7 @@ def layer_weights(layer, idx: int, inter: int, copies: dict):
     if gate.dtype != torch.bfloat16 and not torch.equal(router.float(), gate):
         raise ValueError("needs router weights exactly representable in bf16")
     w_r = pack_bf16(router)
-    copies["router packed", idx] = w_r
+    copies["router packed", i] = w_r
     bias = _need(
         "gate.e_score_correction_bias",
         mlp.gate.e_score_correction_bias,
@@ -199,7 +199,7 @@ def layer_weights(layer, idx: int, inter: int, copies: dict):
     )
     if bias.dtype != torch.float32:
         bias = bias.float()
-        copies["f32 router bias", idx] = bias
+        copies["f32 router bias", i] = bias
     return FlashFfnWeights(
         w_r=w_r,
         bias=bias,
@@ -256,14 +256,14 @@ def _proj(name: str, linear, rows: int, cols: int):
     return w, sc, bool(shuffled)
 
 
-def dsa_weights(layer, idx: int, tp: int, copies: dict):
+def dsa_weights(layer, i: int, tp: int, copies: dict):
     """A sparse-attention layer's attention side: views of SGLang's parameters, plus
     W_UK^T packed once from kv_b_proj into [H, 512, 256] bf16 and the indexer's
     wk | weights_proj in one bf16 matrix."""
     from .runner import FlashDsaWeights
 
     attn = layer.self_attn
-    idx_mod = attn.indexer
+    indexer = attn.indexer
     H = FlashShard(tp=tp).mla_heads
     bf16, f32 = (torch.bfloat16,), (torch.float32,)
     w_qkv, s_qkv, qkv_sh = _proj(
@@ -277,11 +277,11 @@ def dsa_weights(layer, idx: int, tp: int, copies: dict):
     per = NOPE_DIM + V_DIM
     kv_b = _need("kv_b_proj.weight", attn.kv_b_proj.weight, (H * per, KV_LORA), bf16)
     w_uk = kv_b.view(H, per, KV_LORA)[:, :NOPE_DIM].transpose(1, 2).contiguous()
-    copies["W_UK^T bf16", idx] = w_uk
-    wk = _need("indexer.wk.weight", idx_mod.wk.weight, (INDEX_DIM, HIDDEN), bf16)
+    copies["W_UK^T bf16", i] = w_uk
+    wk = _need("indexer.wk.weight", indexer.wk.weight, (INDEX_DIM, HIDDEN), bf16)
     wp = _need(
         "indexer.weights_proj.weight",
-        idx_mod.weights_proj.weight,
+        indexer.weights_proj.weight,
         (INDEX_HEADS, HIDDEN),
         (torch.bfloat16, torch.float32),
     )
@@ -289,7 +289,7 @@ def dsa_weights(layer, idx: int, tp: int, copies: dict):
     if wp.dtype != torch.bfloat16 and not torch.equal(wp16.float(), wp):
         raise ValueError("needs indexer weights_proj exactly representable in bf16")
     w_idx = torch.cat([wk, wp16]).contiguous()
-    copies["indexer wk | weights_proj bf16", idx] = w_idx
+    copies["indexer wk | weights_proj bf16", i] = w_idx
     return FlashDsaWeights(
         hc_fn=_need("hc_attn_fn", layer.hc_attn_fn, (N_MIX, HC_MULT * HIDDEN), f32),
         hc_scale=_need("hc_attn_scale", layer.hc_attn_scale, (3,), f32),
@@ -302,7 +302,7 @@ def dsa_weights(layer, idx: int, tp: int, copies: dict):
         w_idx=w_idx,
         w_gate=_need(
             "indexer.index_kpool_compress_gate",
-            idx_mod.index_kpool_compress_gate,
+            indexer.index_kpool_compress_gate,
             (INDEX_DIM, HIDDEN),
             bf16,
         ),
@@ -310,11 +310,11 @@ def dsa_weights(layer, idx: int, tp: int, copies: dict):
         g_kv=_need(
             "kv_a_layernorm.weight", attn.kv_a_layernorm.weight, (KV_LORA,), bf16
         ),
-        ln_w=_need("indexer.k_norm.weight", idx_mod.k_norm.weight, (INDEX_DIM,), f32),
-        ln_b=_need("indexer.k_norm.bias", idx_mod.k_norm.bias, (INDEX_DIM,), f32),
+        ln_w=_need("indexer.k_norm.weight", indexer.k_norm.weight, (INDEX_DIM,), f32),
+        ln_b=_need("indexer.k_norm.bias", indexer.k_norm.bias, (INDEX_DIM,), f32),
         ape=_need(
             "indexer.index_kpool_compress_ape",
-            idx_mod.index_kpool_compress_ape,
+            indexer.index_kpool_compress_ape,
             (KPOOL, INDEX_DIM),
             f32,
         ),
@@ -322,7 +322,7 @@ def dsa_weights(layer, idx: int, tp: int, copies: dict):
         s_qb=s_qb,
         w_iq=_need(
             "indexer.wq_b.weight",
-            idx_mod.wq_b.weight,
+            indexer.wq_b.weight,
             (INDEX_HEADS * INDEX_DIM, Q_LORA),
             bf16,
         ),
@@ -334,7 +334,7 @@ def dsa_weights(layer, idx: int, tp: int, copies: dict):
     )
 
 
-def kda_weights(layer, idx: int, tp: int, copies: dict):
+def kda_weights(layer, i: int, tp: int, copies: dict):
     """A KDA layer's attention side: views of SGLang's fused bf16 projections; the
     o_norm weight as f32 (a copy when SGLang keeps it in bf16)."""
     from .runner import FlashKdaWeights
@@ -355,7 +355,7 @@ def kda_weights(layer, idx: int, tp: int, copies: dict):
         raise ValueError(f"needs o_norm.weight [{D}], got {got}")
     if w_on.dtype != torch.float32:
         w_on = w_on.float().contiguous()
-        copies["o_norm f32", idx] = w_on
+        copies["o_norm f32", i] = w_on
     return FlashKdaWeights(
         hc_fn=_need("hc_attn_fn", layer.hc_attn_fn, (N_MIX, HC_MULT * HIDDEN), f32),
         hc_scale=_need("hc_attn_scale", layer.hc_attn_scale, (3,), f32),
