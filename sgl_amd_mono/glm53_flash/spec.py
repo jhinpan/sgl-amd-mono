@@ -65,7 +65,12 @@ def _width(rows: int) -> int:
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
-    "srt/arg_groups/fields/*.py": ("page_size", "enable_linear_replayssm"),
+    "srt/arg_groups/fields/*.py": (
+        "page_size",
+        "enable_linear_replayssm",
+        "enable_hisparse",
+        "expert_distribution_recorder_mode",
+    ),
     "srt/configs/glm5_next.py": (
         "num_hidden_layers",
         "first_k_dense_replace",
@@ -707,6 +712,11 @@ SPEC = MonoSpec(
             "moe_runner_backend": frozenset({"auto", "aiter"}),
             # the launch updates the KDA state in place; ReplaySSM defers it to a ring
             "enable_linear_replayssm": frozenset({False}),
+            # HiSparse maps the logical KV slots to device rows; the kernels write raw slots
+            "enable_hisparse": frozenset({False}),
+            # the launches record no expert distribution, and layer 44 would record
+            # outside its layer (SGLang's forward sets it per layer)
+            "expert_distribution_recorder_mode": frozenset({None}),
         },
     ),
     numerics=NUMERICS,
