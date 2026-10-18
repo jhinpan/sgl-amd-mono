@@ -78,6 +78,10 @@ SGLANG_READS = {
         "linear_attn_config",
     ),
     "srt/configs/mamba_utils.py": ("mamba2_state_dtype",),
+    "srt/environ.py": (
+        "SGLANG_SIMULATE_UNIFORM_EXPERTS",
+        "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS",
+    ),
     "srt/configs/model_config.py": ("context_len",),
     "srt/distributed/parallel_state.py": ("cpu_group",),
     "srt/layers/attention/dsa/utils.py": ("aiter_can_use_preshuffle_paged_mqa",),
@@ -722,6 +726,11 @@ SPEC = MonoSpec(
             # the launches record no expert distribution, and layer 44 would record
             # outside its layer (SGLang's forward sets it per layer)
             "expert_distribution_recorder_mode": frozenset({None}),
+        },
+        env={
+            # benchmark routing overrides: the kernel routes with the model's own router
+            "SGLANG_SIMULATE_UNIFORM_EXPERTS": False,
+            "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS": False,
         },
     ),
     numerics=NUMERICS,
