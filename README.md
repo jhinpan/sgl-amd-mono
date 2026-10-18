@@ -77,9 +77,9 @@ sgl-amd-mono/
 ## Testing
 
 ```bash
-pytest test/unit               # CPU only
-pytest test/kernels test/e2e   # 4 x MI350X or MI355X, with DEEPSEEK_V41_FLASH_MODEL_PATH set
-                               # (GLM-5.3-Flash: 8 GPUs, GLM_53_FLASH_MODEL_PATH)
+pytest test/unit                                   # CPU only
+pytest test/kernels test/e2e -k "not glm53_flash"  # 4 x MI350X or MI355X, DEEPSEEK_V41_FLASH_MODEL_PATH set
+pytest test/kernels test/e2e -k glm53_flash        # GLM_53_FLASH_MODEL_PATH set: kernels on 8 GPUs, server at TP4
 ```
 
 ## Contributing
