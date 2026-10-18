@@ -83,10 +83,12 @@ def _regions(L, forward_batch, S: int) -> dict:
     return regions
 
 
-def _f32_routing(mlp, seen: dict):
+def _f32_routing(mlp):
     """A top-k hook that routes in f32 as the model defines it and the kernel does
     (SGLang's AITER top-k adds the ~34 correction bias in bf16): the 8 experts of
     the largest sigmoid + bias, weighted by their sigmoid over its sum, times 2.5."""
+
+    seen = {}
 
     def gate_in(mod, args):
         seen["x"] = args[0]
@@ -123,7 +125,7 @@ def reference(L, positions, h_in, forward_batch, S: int, prev_topk) -> dict:
     saved = {name: t[idx].clone() for name, (t, idx) in regions.items()}
     hidden = set_written(h_in, forward_batch)
     zero = BumpAllocator(buffer_size=4, dtype=torch.float32, device=h_in.device)
-    hooks = _f32_routing(L.module.mlp, {})
+    hooks = _f32_routing(L.module.mlp)
     try:
         out, topk = L.module(
             positions[:S],

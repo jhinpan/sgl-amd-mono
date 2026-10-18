@@ -136,7 +136,6 @@ def experts_reason(moe) -> Optional[str]:
             f"needs the shared expert fused as expert {N_EXPERTS} "
             f"({PHYSICAL_EXPERTS} experts), got {w13.shape[0]}"
         )
-    # SGLang shuffles FP8 experts to (16, 16) only for its AITER MoE runner
     runner = getattr(experts.quant_method, "runner", None)
     if runner is None or not runner.runner_backend.is_aiter():
         return "needs the experts on SGLang's AITER MoE runner, which shuffles them"
@@ -147,7 +146,7 @@ def _uk_uv(attn, heads: int, idx: int, copies: dict):
     """W_UK [H * 512, 192] and W_UV [H * 256, 512] packed from SGLang's per-tensor
     FP8 ``w_kc`` / ``w_vc``, every block scale ``w_scale``: the values SGLang's
     own absorbed attention multiplies by."""
-    w_kc, w_vc, w_scale = attn.w_kc, attn.w_vc, getattr(attn, "w_scale", None)
+    w_kc, w_vc, w_scale = attn.w_kc, attn.w_vc, attn.w_scale
     if w_kc.dtype != torch.float8_e4m3fn or w_scale is None or w_scale.numel() != 1:
         raise ValueError(
             f"needs w_kc / w_vc as per-tensor FP8 E4M3 with a scalar w_scale, got "

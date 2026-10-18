@@ -144,6 +144,7 @@ def layout(
     native_fp4_mfma: bool = False,
 ):
     """Return byte offsets for per-rank scratch and symmetric peer buffers."""
+    from sgl_amd_mono.common.guard import FLAG_BYTES
 
     split_count = sparse_attention_topk // sparse_keys_per_task(samples, heads)
     output_heads = heads if output_heads is None else output_heads
@@ -207,7 +208,7 @@ def layout(
         "flags": 2 * region + 2 * dcp_part,
         "_part_stride": part,
         "_dcp_part_stride": dcp_part,
-        "_bytes": 2 * region + 2 * dcp_part + 256,
+        "_bytes": 2 * region + 2 * dcp_part + FLAG_BYTES,
     }
     return scratch, symmetric
 

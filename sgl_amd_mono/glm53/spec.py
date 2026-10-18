@@ -201,7 +201,6 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
         for name, ids in row_major.items()
     ]
     if unrotated:
-        # the kernel caches and scores Hadamard-rotated index keys
         reasons.append(
             f"the indexer of {_where(unrotated)}: needs SGLang's gfx950 fused DSA "
             "indexer, which caches rotated index keys"
@@ -240,7 +239,7 @@ class _Built:
         self.max_rows = TP_MAX_ROWS.get(tp, max(WIDTHS))
         self.check_layers = os.environ.get("SGLANG_AMD_MONO_CHECK") == "1"
         self.cos, self.sin = cos, sin
-        self.keys = torch.arange(TOPK, dtype=torch.int64, device=device)
+        self.topk_cols = torch.arange(TOPK, dtype=torch.int64, device=device)
         self.steps, self.pad_h = {}, {}
         i32, i64 = torch.int32, torch.int64
         for w in {w for w, _ in runtimes}:
@@ -380,7 +379,7 @@ class _Built:
             raise RuntimeError("GLM-5.3 monokernel: no top-k from the layer before")
         start = step.indptr[:S].to(torch.int64).unsqueeze(1)
         count = (step.indptr[1 : S + 1] - step.indptr[:S]).to(torch.int64).unsqueeze(1)
-        dst = torch.where(self.keys < count, start + self.keys, W * TOPK)
+        dst = torch.where(self.topk_cols < count, start + self.topk_cols, W * TOPK)
         step.topk.scatter_(
             0, dst.reshape(-1), topk_indices[:S].reshape(-1).to(torch.int32)
         )
