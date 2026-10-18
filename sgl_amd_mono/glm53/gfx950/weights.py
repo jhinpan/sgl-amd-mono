@@ -259,11 +259,15 @@ def layer_weights(layer, idx: int, tp: int, copies: dict):
         (torch.float32,),
     )
     gate = moe.gate
-    w_r = pack_bf16(
-        _need("gate", gate.weight, (N_EXPERTS, HIDDEN), (torch.bfloat16, torch.float32))
-        .to(torch.bfloat16)
-        .contiguous()
+    router = _need(
+        "gate", gate.weight, (N_EXPERTS, HIDDEN), (torch.bfloat16, torch.float32)
     )
+    if router.dtype != torch.bfloat16 and not torch.equal(
+        router.to(torch.bfloat16).float(), router
+    ):
+        # SGLang routes an f32 gate (router_fp32) in f32; the kernel's router is bf16
+        raise ValueError("needs router weights exactly representable in bf16")
+    w_r = pack_bf16(router.to(torch.bfloat16).contiguous())
     copies["router packed", idx] = w_r
     bias = _need(
         "e_score_correction_bias",
