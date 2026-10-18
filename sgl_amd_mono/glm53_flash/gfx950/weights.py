@@ -351,7 +351,8 @@ def kda_weights(layer, idx: int, tp: int, copies: dict):
         raise ValueError("needs the short conv without bias")
     w_on = attn.o_norm.weight
     if w_on is None or tuple(w_on.shape) != (D,):
-        raise ValueError("needs o_norm with a weight")
+        got = None if w_on is None else tuple(w_on.shape)
+        raise ValueError(f"needs o_norm.weight [{D}], got {got}")
     if w_on.dtype != torch.float32:
         w_on = w_on.float().contiguous()
         copies["o_norm f32", idx] = w_on

@@ -512,21 +512,30 @@ class _Built:
             return
         reasons = []
         if kv.dtype != torch.bfloat16 or kv.shape[1] < 512 or kv.stride(1) != 1:
-            reasons.append(f"MLA cache {kv.dtype} {tuple(kv.shape)} {kv.stride()}")
+            reasons.append(
+                f"MLA cache {kv.dtype} {tuple(kv.shape)} {kv.stride()}, needs bf16 "
+                "[slots, >= 512] with unit stride"
+            )
         if (
             idx.dtype != torch.uint8
             or idx.dim() != 2
             or idx.shape[1] != INDEX_BLOCK_POOLS * 132
             or not idx.is_contiguous()
         ):
-            reasons.append(f"index cache {idx.dtype} {tuple(idx.shape)}")
+            reasons.append(
+                f"index cache {idx.dtype} {tuple(idx.shape)}, needs contiguous uint8 "
+                f"[pages, {INDEX_BLOCK_POOLS * 132}]"
+            )
         for name, t in (("k", tail_k), ("gate", tail_g)):
             if (
                 t.dtype != torch.bfloat16
                 or tuple(t.shape[1:]) != (4, 128)
                 or not t.is_contiguous()
             ):
-                reasons.append(f"kpool {name} ring {t.dtype} {tuple(t.shape)}")
+                reasons.append(
+                    f"kpool {name} ring {t.dtype} {tuple(t.shape)}, needs contiguous "
+                    "bf16 [slots, 4, 128]"
+                )
         if reasons:
             raise RuntimeError(
                 f"GLM-5.3-Flash monokernel: layer {L.i}: " + "; ".join(reasons)
