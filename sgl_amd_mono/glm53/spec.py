@@ -486,9 +486,16 @@ def _build(model, hf_config, ctx) -> _Built:
         "shared": [i for i in covered if layers[i].w.index is None],
     }
     fault_site, fault_after = guard.fault_injection(rank) or (0, 0)
+    context_len = process_model_config().context_len
+    # the copied table is SGLang's at build; a longer served context reads past it
+    if cos.shape[0] < context_len:
+        raise ValueError(
+            f"GLM-5.3 monokernel: the rotary table holds {cos.shape[0]} positions, "
+            f"the server's context is {context_len}"
+        )
     # the keys an indexer row scores at most: the served context's, in whole tasks
-    step_keys = INDEX_KEYS_PER_TASK
-    max_seq = -(-process_model_config().context_len // step_keys) * step_keys
+    tasks = -(-context_len // INDEX_KEYS_PER_TASK)
+    max_seq = tasks * INDEX_KEYS_PER_TASK
     cap = TP_MAX_ROWS.get(tp, max(WIDTHS))
     widths = sorted({_width(r) for r in ctx.widths if r <= cap})
     runtimes = {}
