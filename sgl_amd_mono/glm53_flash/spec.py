@@ -122,7 +122,6 @@ SGLANG_READS = {
         "gemm_output_zero_allocator_size",
         "norm",
         "self_attn",
-        "mlp",
         "hc_post",
         "is_linear_attn",
         "is_mrope_enabled",
