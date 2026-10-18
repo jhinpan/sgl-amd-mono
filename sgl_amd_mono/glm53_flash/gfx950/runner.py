@@ -316,7 +316,10 @@ class FlashLayerOp:
                 )
             _check("rows", rows, (S, ROW_WORDS), torch.int32)
             if page_table.dtype != torch.int32 or page_table.stride(1) != 1:
-                raise ValueError("needs an int32 page table with contiguous rows")
+                raise ValueError(
+                    "GLM-5.3-Flash monokernel needs an int32 page table with contiguous "
+                    f"rows, got {page_table.dtype} {page_table.stride()}"
+                )
             d = self.dsa
             kda_args[:4] = [p(d.hc_fn), p(d.hc_scale), p(d.hc_base), p(d.g_norm)]
             dsa_args = [

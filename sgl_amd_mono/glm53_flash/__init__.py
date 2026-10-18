@@ -16,6 +16,7 @@ HF_CONFIG = dict(
     n_routed_experts=288,
     num_experts_per_tok=8,
     n_shared_experts=1,
+    moe_layer_freq=1,
     moe_intermediate_size=2048,
     routed_scaling_factor=2.5,
     scoring_func="sigmoid",

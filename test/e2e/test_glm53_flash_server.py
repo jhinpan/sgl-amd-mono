@@ -2,8 +2,9 @@
 switch points: decode steps of 1 to 8 rows run the kernels, wider ones the normal
 path, and requests join and leave a running batch that steps past 8 rows and back
 (a short GSM8K run, for gross failures); the tokens of covered steps scored again by
-the normal prefill path (KL consistency); and a fault on one rank that stops the
-server before any token of the failed step is sent."""
+the normal prefill path (KL consistency); each covered layer against SGLang's own
+under SGLANG_AMD_MONO_CHECK; and a fault on one rank that stops the server before
+any token of the failed step is sent."""
 
 import os
 import re

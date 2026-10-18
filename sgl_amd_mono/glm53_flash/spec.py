@@ -21,7 +21,7 @@ keep the normal path. A KDA pad row (state index not positive) keeps every state
 a sparse-attention pad row (SGLang's padding slot 0) writes no cache.
 
 The kernels read SGLang's weights in place, except the copies logged at startup:
-the router packed for the MFMA tiles, W_UK^T from kv_b_proj, the indexer's
+the router packed for the MFMA tiles and its bias in f32, W_UK^T from kv_b_proj, the indexer's
 wk | weights_proj in bf16, the o_norm weight in f32, and the shared expert packed
 as one AITER expert where SGLang keeps it apart (TP2).
 """
@@ -65,7 +65,12 @@ def _width(rows: int) -> int:
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
-    "srt/arg_groups/fields/*.py": ("page_size", "enable_linear_replayssm"),
+    "srt/arg_groups/fields/*.py": (
+        "page_size",
+        "enable_linear_replayssm",
+        "enable_hisparse",
+        "expert_distribution_recorder_mode",
+    ),
     "srt/configs/glm5_next.py": (
         "num_hidden_layers",
         "first_k_dense_replace",
@@ -73,7 +78,13 @@ SGLANG_READS = {
         "linear_attn_config",
     ),
     "srt/configs/mamba_utils.py": ("mamba2_state_dtype",),
+    "srt/environ.py": (
+        "SGLANG_SIMULATE_UNIFORM_EXPERTS",
+        "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS",
+    ),
     "srt/configs/model_config.py": ("context_len",),
+    "srt/distributed/parallel_state.py": ("cpu_group",),
+    "srt/layers/attention/dsa/utils.py": ("aiter_can_use_preshuffle_paged_mqa",),
     "srt/layers/attention/dsa_backend.py": ("forward_metadata", "real_page_table"),
     "srt/layers/attention/hybrid_linear_attn_backend.py": (
         "full_attn_backend",
@@ -100,6 +111,7 @@ SGLANG_READS = {
     "srt/model_executor/forward_batch_info.py": (
         "out_cache_loc",
         "req_pool_indices",
+        "forward_mode",
         "is_idle",
     ),
     "srt/model_executor/forward_context.py": (
@@ -112,12 +124,13 @@ SGLANG_READS = {
         "model",
         "embed_tokens",
         "layers",
+        "input_layernorm",
+        "do_fuse_qkvbfg",
         "start_layer",
         "end_layer",
         "gemm_output_zero_allocator_size",
         "norm",
         "self_attn",
-        "mlp",
         "hc_post",
         "is_linear_attn",
         "is_mrope_enabled",
@@ -131,6 +144,9 @@ SGLANG_READS = {
         "Numerics",
         "NumericsKind",
         "Requirements",
+        "widths",
+        "deadline_s",
+        "copies",
     ),
     "srt/runtime_context.py": (
         "get_parallel",
@@ -179,6 +195,9 @@ def _covered_layers(config) -> list[int]:
 
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     from sglang.srt.configs.mamba_utils import mamba2_state_dtype
+    from sglang.srt.layers.attention.dsa.utils import (
+        aiter_can_use_preshuffle_paged_mqa,
+    )
 
     text = _text(hf_config)
     reasons = [
@@ -207,6 +226,11 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     if cfg.page_size not in (None, PAGE_SIZE):
         reasons.append(
             f"--page-size {cfg.page_size}: the kpool caches need {PAGE_SIZE}"
+        )
+    if not aiter_can_use_preshuffle_paged_mqa():
+        reasons.append(
+            "needs the index cache in AITER's preshuffled layout, which the kernels "
+            "write; without AITER's preshuffle paged MQA, SGLang keeps it row-major"
         )
     quant = (getattr(hf_config, "quantization_config", None) or {}).get("quant_method")
     if quant != "quark":
@@ -496,21 +520,30 @@ class _Built:
             return
         reasons = []
         if kv.dtype != torch.bfloat16 or kv.shape[1] < 512 or kv.stride(1) != 1:
-            reasons.append(f"MLA cache {kv.dtype} {tuple(kv.shape)} {kv.stride()}")
+            reasons.append(
+                f"MLA cache {kv.dtype} {tuple(kv.shape)} {kv.stride()}, needs bf16 "
+                "[slots, >= 512] with unit stride"
+            )
         if (
             idx.dtype != torch.uint8
             or idx.dim() != 2
             or idx.shape[1] != INDEX_BLOCK_POOLS * 132
             or not idx.is_contiguous()
         ):
-            reasons.append(f"index cache {idx.dtype} {tuple(idx.shape)}")
+            reasons.append(
+                f"index cache {idx.dtype} {tuple(idx.shape)}, needs contiguous uint8 "
+                f"[pages, {INDEX_BLOCK_POOLS * 132}]"
+            )
         for name, t in (("k", tail_k), ("gate", tail_g)):
             if (
                 t.dtype != torch.bfloat16
                 or tuple(t.shape[1:]) != (4, 128)
                 or not t.is_contiguous()
             ):
-                reasons.append(f"kpool {name} ring {t.dtype} {tuple(t.shape)}")
+                reasons.append(
+                    f"kpool {name} ring {t.dtype} {tuple(t.shape)}, needs contiguous "
+                    "bf16 [slots, 4, 128]"
+                )
         if reasons:
             raise RuntimeError(
                 f"GLM-5.3-Flash monokernel: layer {L.i}: " + "; ".join(reasons)
@@ -628,6 +661,11 @@ def _build(model, hf_config, ctx) -> _Built:
     runtimes = {}
     cap = TP_MAX_ROWS.get(tp, max(WIDTHS))
     widths = sorted({_width(r) for r in ctx.widths if r <= cap})
+    if not widths:
+        raise ValueError(
+            f"GLM-5.3-Flash monokernel: TP{tp} runs at most {cap} rows on the kernels, "
+            f"and this server's decode graphs route {sorted(ctx.widths)}"
+        )
     # each runtime's peer handshake is collective: every rank builds them in one order
     for w in widths:
         for kind, ids in kinds.items():
@@ -683,6 +721,16 @@ SPEC = MonoSpec(
             "moe_runner_backend": frozenset({"auto", "aiter"}),
             # the launch updates the KDA state in place; ReplaySSM defers it to a ring
             "enable_linear_replayssm": frozenset({False}),
+            # HiSparse maps the logical KV slots to device rows; the kernels write raw slots
+            "enable_hisparse": frozenset({False}),
+            # the launches record no expert distribution, and layer 44 would record
+            # outside its layer (SGLang's forward sets it per layer)
+            "expert_distribution_recorder_mode": frozenset({None}),
+        },
+        env={
+            # benchmark routing overrides: the kernel routes with the model's own router
+            "SGLANG_SIMULATE_UNIFORM_EXPERTS": False,
+            "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS": False,
         },
     ),
     numerics=NUMERICS,
