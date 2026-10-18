@@ -148,6 +148,7 @@ from .ops import (
 )
 from .ops import xred as _xred
 from .ops import xshfl as _xshfl
+from .sources import SOURCES
 from .tiles import (
     CM_DEV,
     CM_SYS,
@@ -373,6 +374,9 @@ def build_glm5_monokernel(
     class Smem:
         work: fx.Array[fx.Float32, WORK_WORDS, 16]
 
+    # the sources digest: an edit to common/ or these kernel sources rebuilds
+    keyed = (("sources", SOURCES),)
+
     @flyc.kernel(known_block_size=[THREADS, 1, 1])
     def glm5_monokernel(
         h_in: Int64,
@@ -418,6 +422,7 @@ def build_glm5_monokernel(
         layer: Int32,
         bt_stride: Int32,
     ):
+        _ = keyed
         # every wait of this launch runs under the guard (deadline, error words);
         # the scope is entered by hand so the traced body keeps its indentation
         guarded = guard.scope(
@@ -4644,6 +4649,7 @@ def build_glm5_monokernel(
         bt_stride: Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
+        _ = keyed
         glm5_monokernel(
             h_in,
             x_out,
