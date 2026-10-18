@@ -22,6 +22,7 @@ GLM53 = SimpleNamespace(
     first_k_dense_replace=3,
     moe_layer_freq=1,
     quantization_config={"quant_method": "fp8", "weight_block_size": [128, 128]},
+    rope_parameters={"rope_theta": 8000000, "rope_type": "default"},
     architectures=["GlmMoeDsaForCausalLM"],
 )
 
@@ -82,6 +83,7 @@ def test_config_reasons_name_each_mismatch():
             "index_topk_freq": 8,
             "moe_layer_freq": 2,
             "quantization_config": {"quant_method": "quark"},
+            "rope_parameters": {"rope_type": "yarn", "factor": 4.0},
         }
     )
     reasons = glm53._config_disable_reasons(SimpleNamespace(page_size=1), other)
@@ -90,6 +92,7 @@ def test_config_reasons_name_each_mismatch():
     assert "MoE" in text
     assert "--page-size 1" in text
     assert "FP8 block-128" in text
+    assert "RoPE 'yarn'" in text
 
 
 def _linear(shuffled=True):

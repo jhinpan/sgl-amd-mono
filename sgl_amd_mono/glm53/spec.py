@@ -148,6 +148,15 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     ]
     if getattr(hf_config, "moe_layer_freq", 1) != 1:
         reasons.append("needs every layer after the dense ones to be MoE")
+    # SGLang scales the softmax by YaRN's mscale; the kernel's scale is fixed
+    rope = (
+        getattr(hf_config, "rope_parameters", None)
+        or getattr(hf_config, "rope_scaling", None)
+        or {}
+    )
+    rope_type = rope.get("rope_type", rope.get("type", "default"))
+    if rope_type != "default":
+        reasons.append(f"RoPE {rope_type!r}: the kernel's softmax scale is unscaled")
     if cfg.page_size not in (None, PAGE_SIZE):
         reasons.append(f"--page-size {cfg.page_size}: the DSA caches need {PAGE_SIZE}")
     quant = getattr(hf_config, "quantization_config", None) or {}
