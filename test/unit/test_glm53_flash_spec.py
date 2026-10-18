@@ -17,7 +17,6 @@ TEXT = SimpleNamespace(
     **HF_CONFIG,
     num_hidden_layers=45,
     first_k_dense_replace=3,
-    moe_layer_freq=1,
     linear_attn_config={
         **LINEAR_ATTN_CONFIG,
         "kda_layers": [i for i in range(45) if i % 4 != 3],
@@ -99,6 +98,7 @@ def test_config_reasons_name_each_mismatch(monkeypatch):
         **{
             **vars(TEXT),
             "hidden_size": 6144,
+            "moe_layer_freq": 2,
             "linear_attn_config": {
                 **TEXT.linear_attn_config,
                 "num_heads": 32,
@@ -120,6 +120,7 @@ def test_config_reasons_name_each_mismatch(monkeypatch):
     joined = " | ".join(reasons)
     for want in (
         "hidden_size = 4096",
+        "moe_layer_freq = 1",
         "num_heads = 64",
         "layer 42: the last KDA layer",
         "KDA state in f32",
@@ -128,7 +129,7 @@ def test_config_reasons_name_each_mismatch(monkeypatch):
         "Quark checkpoint",
     ):
         assert want in joined, joined
-    assert len(reasons) == 7, reasons
+    assert len(reasons) == 8, reasons
 
 
 def _layer(kda=True, shuffled=True, scale_dims=3, fused=True, indexer=True):
