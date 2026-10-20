@@ -388,7 +388,7 @@ class _Built:
                 plan.state["ref_topk"] = ref["topk"]
         out = L.ops[W].launch(h, L.caches, self.cos, self.sin, step)
         if checking:
-            check.compare(L, ref, out[:S], positions, forward_batch, S, step)
+            check.compare(L, ref, out[:S], positions, forward_batch, S, step=step)
         if L.i != self.last:
             return out
         for (w, _), rt in self.runtimes.items():

@@ -35,8 +35,8 @@ LAUNCH_TIMEOUT = 3600
 GSM8K_BOUND = 0.90
 # Decode against prefill, one batch of prompts at a time (every decode step covered)
 KL_BOUND = 0.06
-# MTP (3 draft tokens) accepts about 3.1 tokens a step on this GSM8K run (measured at
-# TP4); the bound is for gross failures
+# MTP (3 draft tokens) accepts about 3.3 tokens a step on this GSM8K run at TP8;
+# the bound is for gross failures
 MTP_ACCEPT_BOUND = 2.5
 
 
@@ -105,13 +105,15 @@ class TestMonokernelDecode(CustomTestCase):
 
 
 class TestMonokernelMtp(CustomTestCase):
+    process = None
+
     @classmethod
     def setUpClass(cls):
         cls.process = _launch(extra_args=[*MTP, "--watchdog-timeout", "1200"])
 
     @classmethod
     def tearDownClass(cls):
-        if getattr(cls, "process", None) is not None:
+        if cls.process is not None:
             terminate_and_kill_process_tree(cls.process)
 
     def test_gsm8k_and_accept_length_past_the_largest_width(self):
@@ -126,76 +128,79 @@ class TestMonokernelMtp(CustomTestCase):
         self.assertGreater(accept, MTP_ACCEPT_BOUND)
 
 
-def _layer_checks(test, extra_args, batches, new_tokens, rows):
-    """SGLANG_AMD_MONO_CHECK (eager): the normal layer runs next to each covered
-    layer. Each (requests, repeats) batch of a record prompt runs on one server; the
-    checks must cover both kinds of layer at every count in ``rows``, an indexer
-    layer past 2048 keys, and log no violation."""
-    para = "The river valley archive lists the flood height of every year. "
-    with (
-        tempfile.NamedTemporaryFile("w+", suffix=".out") as out,
-        tempfile.NamedTemporaryFile("w+", suffix=".err") as err,
-    ):
-        process = _launch(
-            extra_env={"SGLANG_AMD_MONO_CHECK": "1"},
-            extra_args=[
-                "--disable-cuda-graph",
-                "--watchdog-timeout",
-                "1200",
-                *extra_args,
-            ],
-            log=(out, err),
-        )
-        try:
-            for n, repeats in batches:
-                r = requests.post(
-                    DEFAULT_URL_FOR_TEST + "/generate",
-                    json={
-                        "text": [f"Record {i}. " + para * repeats for i in range(n)],
-                        "sampling_params": {
-                            "max_new_tokens": new_tokens,
-                            "temperature": 0,
-                        },
-                    },
-                    timeout=600,
-                )
-                r.raise_for_status()
-        finally:
-            terminate_and_kill_process_tree(process)
-        err.seek(0)
-        out.seek(0)
-        log = err.read() + out.read()
-    checks = re.findall(
-        r"monokernel check layer \d+ \((indexer|shared), (\d+) rows, positions "
-        r"\d+\.\.(\d+)\): (.*)",
-        log,
-    )
-    values = {}
-    for _, _, _, fields in checks:
-        for name, v in re.findall(r"(\S+)=(\S+)", fields):
-            values.setdefault(name, []).append(float(v))
-    for name, vs in sorted(values.items()):
-        print(f"{name}: min {min(vs):.6g} max {max(vs):.6g} ({len(vs)} checks)")
-    seen = {(kind, int(n)) for kind, n, _, _ in checks}
-    want = {(kind, n) for kind in ("indexer", "shared") for n in rows}
-    test.assertTrue(want <= seen, seen)
-    test.assertTrue(any(k == "indexer" and int(hi) >= 2048 for k, _, hi, _ in checks))
-    violations = re.findall(r"monokernel check violation: .*", log)
-    test.assertEqual(violations, [], "\n".join(violations[:20]))
-
-
 class TestMonokernelCheck(CustomTestCase):
     def test_each_covered_layer_within_its_numerics(self):
         # 1, 3 and 8 rows run at widths 2, 4 and 8 (pad rows on the first two), and
         # the long prompt's positions pass 2048, where the indexer selects keys
-        _layer_checks(
-            self, [], ((1, 2), (3, 2), (8, 2), (1, 200)), new_tokens=4, rows=(1, 3, 8)
+        self._check_layers(
+            [], ((1, 2), (3, 2), (8, 2), (1, 200)), new_tokens=4, rows=(1, 3, 8)
         )
 
     def test_each_covered_verify_layer_within_its_numerics(self):
-        # MTP verify steps of 1 and 2 requests (4 and 8 rows) past 2048 keys: the
-        # indexer selects among each request's prefix and the drafts this step writes
-        _layer_checks(self, MTP, ((1, 200), (2, 200)), new_tokens=16, rows=(4, 8))
+        # MTP verify steps of 1 and 2 requests (4 and 8 rows) past 2048 keys. The
+        # check poisons the cached scales of this step's keys, so a launch that reads
+        # a row's earlier drafts from the cache misses some of them (layer.topk_own)
+        self._check_layers(MTP, ((1, 200), (2, 200)), new_tokens=16, rows=(4, 8))
+
+    def _check_layers(self, extra_args, batches, new_tokens, rows):
+        """SGLANG_AMD_MONO_CHECK (eager) on one server, each (requests, repeats)
+        batch of a record prompt in turn: both kinds of layer checked at every
+        count in ``rows``, an indexer layer past 2048 keys, and no violation."""
+        para = "The river valley archive lists the flood height of every year. "
+        with (
+            tempfile.NamedTemporaryFile("w+", suffix=".out") as out,
+            tempfile.NamedTemporaryFile("w+", suffix=".err") as err,
+        ):
+            process = _launch(
+                extra_env={"SGLANG_AMD_MONO_CHECK": "1"},
+                extra_args=[
+                    "--disable-cuda-graph",
+                    "--watchdog-timeout",
+                    "1200",
+                    *extra_args,
+                ],
+                log=(out, err),
+            )
+            try:
+                for n, repeats in batches:
+                    r = requests.post(
+                        DEFAULT_URL_FOR_TEST + "/generate",
+                        json={
+                            "text": [
+                                f"Record {i}. " + para * repeats for i in range(n)
+                            ],
+                            "sampling_params": {
+                                "max_new_tokens": new_tokens,
+                                "temperature": 0,
+                            },
+                        },
+                        timeout=600,
+                    )
+                    r.raise_for_status()
+            finally:
+                terminate_and_kill_process_tree(process)
+            err.seek(0)
+            out.seek(0)
+            log = err.read() + out.read()
+        checks = re.findall(
+            r"monokernel check layer \d+ \((indexer|shared), (\d+) rows, positions "
+            r"\d+\.\.(\d+)\): (.*)",
+            log,
+        )
+        values = {}
+        for _, _, _, fields in checks:
+            for name, v in re.findall(r"(\S+)=(\S+)", fields):
+                values.setdefault(name, []).append(float(v))
+        for name, vs in sorted(values.items()):
+            print(f"{name}: min {min(vs):.6g} max {max(vs):.6g} ({len(vs)} checks)")
+        seen = {(kind, int(n)) for kind, n, _, _ in checks}
+        want = {(kind, n) for kind in ("indexer", "shared") for n in rows}
+        self.assertTrue(want <= seen, seen)
+        self.assertTrue(
+            any(k == "indexer" and int(hi) >= 2048 for k, _, hi, _ in checks)
+        )
+        violations = re.findall(r"monokernel check violation: .*", log)
+        self.assertEqual(violations, [], "\n".join(violations[:20]))
 
 
 class TestMonokernelFault(CustomTestCase):

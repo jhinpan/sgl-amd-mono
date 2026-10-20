@@ -1,8 +1,8 @@
 """The GLM-5.3 gfx950 monokernel spec on CPU (RFC #43949): the layers its forward
 covers on the GLM-5.3 layer structure, its row routing and TP4 row cap, the keys
-each row of a decode or MTP verify step attends, its registry entry, and its config
-and model refusal reasons. SGLang checks its declared requirements, the same way
-for every spec."""
+each row of a decode or MTP verify step attends, its registry entry, its config and
+model refusal reasons, and the layer check's top-k metric and cache poisoning.
+SGLang checks its declared requirements, the same way for every spec."""
 
 from types import SimpleNamespace
 from unittest import mock
@@ -13,7 +13,7 @@ from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.monokernels import spec as registry
 
 import sgl_amd_mono
-from sgl_amd_mono.glm53 import HF_CONFIG
+from sgl_amd_mono.glm53 import HF_CONFIG, check
 from sgl_amd_mono.glm53 import spec as glm53
 from sgl_amd_mono.glm53.gfx950.weights import rope_tables
 
@@ -27,6 +27,21 @@ GLM53 = SimpleNamespace(
     rope_parameters={"rope_theta": 8000000, "rope_type": "default"},
     architectures=["GlmMoeDsaForCausalLM"],
 )
+# the server arguments the spec reads before load: no speculative decoding
+CFG = SimpleNamespace(page_size=None, speculative_algorithm=None)
+# MTP: SGLang's GLM-5.3 default draft chain (NEXTN resolves to EAGLE)
+MTP = SimpleNamespace(
+    page_size=None,
+    speculative_algorithm="EAGLE",
+    speculative_eagle_topk=1,
+    speculative_num_steps=3,
+    speculative_num_draft_tokens=4,
+)
+# the graph keys of a verify step of one request (4 rows) and a decode step of 4
+VERIFY = registry.ShapeKey(
+    forward_mode="target_verify", batch_size=1, tokens_per_request=4
+)
+DECODE = registry.ShapeKey(forward_mode="decode", batch_size=4, tokens_per_request=1)
 
 
 def test_the_forward_covers_the_moe_layers():
@@ -59,6 +74,12 @@ class _Lm:
         return "the model's forward"
 
 
+def _built(lm, layers, runtimes, tp=8, context_len=202752):
+    return glm53._Built(
+        lm, layers, runtimes, None, None, tp, "cpu", context_len=context_len
+    )
+
+
 def test_a_step_runs_at_the_next_width_and_tp4_takes_four_rows():
     # a one-row launch never completes on gfx950: one row runs at width 2
     assert [glm53._width(r) for r in glm53.ROWS] == [2, 2, 4, 4, 8, 8, 8, 8]
@@ -74,14 +95,9 @@ def test_a_step_runs_at_the_next_width_and_tp4_takes_four_rows():
     assert _built(lm, layers, runtimes, tp=8).max_rows == 8
 
 
-def _built(lm, layers, runtimes, tp=8, context_len=202752):
-    return glm53._Built(
-        lm, layers, runtimes, None, None, tp, "cpu", context_len=context_len
-    )
-
-
-def _step_rows(positions, slots, seq_lens, context_len=202752):
-    """``_Built._step`` on CPU: each row's position and its keys (indptr)."""
+def _step_rows(key, positions, slots, seq_lens, context_len=202752):
+    """``_Built._step`` on CPU for a 4-row step: each row's position and its keys
+    (indptr). ``seq_lens`` is what SGLang passes: one length per request."""
     W = 4
     runtimes = {(W, k): None for k in ("index", "shared")}
     built = _built(_Lm(), {3: None}, runtimes, context_len=context_len)
@@ -90,9 +106,6 @@ def _step_rows(positions, slots, seq_lens, context_len=202752):
     )
     backend = SimpleNamespace(
         forward_metadata=SimpleNamespace(real_page_table=torch.zeros(W, 1))
-    )
-    key = registry.ShapeKey(
-        forward_mode="target_verify", batch_size=1, tokens_per_request=W
     )
     with mock.patch(
         "sglang.srt.model_executor.forward_context.get_attn_backend",
@@ -104,51 +117,86 @@ def _step_rows(positions, slots, seq_lens, context_len=202752):
     return step.positions.tolist(), step.indptr.tolist()
 
 
-def test_a_verify_row_sees_its_prefix_and_the_drafts_up_to_it():
-    # one request of prefix 10 verifies 4 drafts at positions 10..13: SGLang's
-    # seq_lens holds the prefix, and row j attends 10 + j + 1 keys
-    _, indptr = _step_rows([10, 11, 12, 13], [100, 101, 102, 103], [10])
-    assert indptr == [0, 11, 23, 36, 50]
-    # a decode step: one row a request, seq_lens = position + 1; a pad row attends none
-    _, indptr = _step_rows([5, 7, 0, 0], [40, 41, 0, 0], [6, 8, 1, 1])
-    assert indptr == [0, 6, 14, 14, 14]
-    # past 2048 keys a row attends the indexer's top-2048
-    _, indptr = _step_rows([4000, 4001, 4002, 4003], [7, 8, 9, 10], [4000])
-    assert indptr == [0, 2048, 4096, 6144, 8192]
+@pytest.mark.parametrize(
+    "key, positions, slots, seq_lens, indptr",
+    [
+        # one request of prefix 10 verifies 4 drafts at positions 10 to 13
+        (VERIFY, [10, 11, 12, 13], [100, 101, 102, 103], [10], [0, 11, 23, 36, 50]),
+        # one row a request (seq_lens = position + 1); slot 0 is a pad row
+        (DECODE, [5, 7, 0, 0], [40, 41, 0, 0], [6, 8, 1, 1], [0, 6, 14, 14, 14]),
+        # a row attends at most the indexer's 2048 keys
+        (
+            VERIFY,
+            [4000, 4001, 4002, 4003],
+            [7, 8, 9, 10],
+            [4000],
+            [0, 2048, 4096, 6144, 8192],
+        ),
+    ],
+    ids=["verify step", "decode step and a pad row", "rows past 2048 keys"],
+)
+def test_each_row_attends_the_keys_up_to_its_position(
+    key, positions, slots, seq_lens, indptr
+):
+    """A verify row attends its request's prefix and the drafts up to itself, not
+    the prefix alone: in a verify step SGLang's seq_lens holds only the prefix."""
+    assert _step_rows(key, positions, slots, seq_lens)[1] == indptr
 
 
 def test_verify_lookahead_past_the_context_stays_in_the_tables():
-    # a 12-token context: drafts at 12 and 13 are lookahead the scheduler discards;
-    # they keep positions the rotary table and the indexer's score rows hold
+    """Verify rows past the context keep positions inside the rotary table and the
+    indexer's score rows (12 tokens here); the scheduler discards their tokens."""
     positions, indptr = _step_rows(
-        [10, 11, 12, 13], [100, 101, 102, 103], [10], context_len=12
+        VERIFY, [10, 11, 12, 13], [100, 101, 102, 103], [10], context_len=12
     )
     assert positions == [10, 11, 11, 11]
     assert indptr == [0, 11, 23, 35, 47]
 
 
-# the server arguments the spec reads before load: no speculative decoding
-CFG = SimpleNamespace(page_size=None, speculative_algorithm=None)
-# MTP: SGLang's GLM-5.3 default draft chain (NEXTN resolves to EAGLE)
-MTP = SimpleNamespace(
-    page_size=None,
-    speculative_algorithm="EAGLE",
-    speculative_eagle_topk=1,
-    speculative_num_steps=3,
-    speculative_num_draft_tokens=4,
-)
-
-
 @pytest.mark.parametrize(
-    "changes",
-    [{"speculative_eagle_topk": 2}, {"speculative_num_draft_tokens": 3}],
-    ids=["tree draft", "draft tokens"],
+    "changes, refused",
+    [
+        ({}, False),
+        ({"speculative_eagle_topk": 2}, True),
+        ({"speculative_num_draft_tokens": 3}, True),
+    ],
+    ids=["default chain", "tree draft", "draft tokens"],
 )
-def test_mtp_runs_one_draft_chain(changes):
-    assert glm53._config_disable_reasons(MTP, GLM53) == []
+def test_mtp_runs_one_draft_chain(changes, refused):
     cfg = SimpleNamespace(**{**vars(MTP), **changes})
     reasons = glm53._config_disable_reasons(cfg, GLM53)
-    assert len(reasons) == 1 and "one draft chain" in reasons[0]
+    assert len(reasons) == int(refused)
+    assert all("one draft chain" in r for r in reasons)
+
+
+def test_the_layer_check_counts_the_own_chain_keys_a_row_drops():
+    # row 0 drops SGLang's 11 and its own slot 100; row 1 drops SGLang's 21 for row
+    # 0's slot 100, which is no drop of its own chain; row 2 is a pad row
+    ref = torch.full((3, 2048), -1)
+    ref[0, :3] = torch.tensor([10, 11, 100])
+    ref[1, :2] = torch.tensor([20, 21])
+    topk = torch.zeros(2 * 2048 + 1, dtype=torch.int32)
+    topk[:5] = torch.tensor([10, 12, 13, 20, 100])
+    step = SimpleNamespace(indptr=torch.tensor([0, 3, 5, 5]), topk=topk)
+    out = check._topk_outputs(ref, step, torch.tensor([100, 101, 0]), 3)
+    assert out == {"topk": {"rel": 2 / 3}, "topk_own": {"max_abs": 1.0}}
+
+
+def test_the_layer_check_poisons_only_this_steps_index_scales():
+    # page 1 token 5 and page 2 token 63 are this step's keys; slot 0 is a pad row.
+    # Bytes below 120 keep every f32 scale and FP8 value finite
+    pages = torch.randint(0, 120, (3, check.PAGE_TOKENS * 132), dtype=torch.uint8)
+    before = pages.clone()
+    check.poison_new_index_scales(pages, torch.tensor([0, 64 + 5, 128 + 63]))
+    _, scales = check._index_keys(before)
+    _, new_scales = check._index_keys(pages)
+    poisoned = torch.zeros_like(scales, dtype=torch.bool)
+    poisoned[1, 5] = poisoned[2, 63] = True
+    assert (new_scales[poisoned] == check.POISON_SCALE).all()
+    assert torch.equal(new_scales[~poisoned], scales[~poisoned])
+    # the FP8 values stay, so only the scale of a key read from the cache changes
+    values = slice(0, check.INDEX_VALUE_BYTES)
+    assert torch.equal(pages[:, values], before[:, values])
 
 
 def test_config_reasons_name_each_mismatch():
