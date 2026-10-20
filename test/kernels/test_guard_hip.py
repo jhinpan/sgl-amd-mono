@@ -30,13 +30,15 @@ def _build(publish: bool, fault_site=None, stop=False):
 
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.common.ops import CM_DEV, rsrc
-    from sgl_amd_mono.common.plan import THREADS
+    from sgl_amd_mono.common.plan import THREADS, kernel_sources
     from sgl_amd_mono.common.sync import Mailbox, sreg
 
     name = f"mono_guard_test_p{int(publish)}_f{fault_site or 0}_s{int(stop)}"
+    keyed = (publish, fault_site, stop, kernel_sources(guard.__name__))
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def k(epoch: Int64, box: Int64):
+        _ = keyed
         with guard.scope(guard.Guard(epoch, fault_site=fault_site, stop=stop)):
             # held in a dict, as the kernels hold it: traced branches carry IR values only
             c = {"mb": Mailbox(fx.Int32(7))}
@@ -49,6 +51,7 @@ def _build(publish: bool, fault_site=None, stop=False):
 
     @flyc.jit
     def launch(epoch: Int64, box: Int64, stream: fx.Stream = fx.Stream(None)):
+        _ = keyed
         k(epoch, box).launch(grid=(2,), block=(THREADS,), stream=stream)
 
     return launch

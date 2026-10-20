@@ -2,13 +2,14 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """MiniMax-M3 reduction order shared with its unfused all-reduce epilogue."""
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import gpu, range_constexpr
 
-from sgl_amd_mono.common.ops import butterfly, traced
+from sgl_amd_mono.common.ops import butterfly
 
 
-@traced
+@flyc.jit
 def ar_block_sums(parts, lane, wave, red):
     """Per row ``(p0, p1)`` of ``parts``, the sum of the 768 per-pack partials of a
     6144-wide bf16 row in the order the 1-stage fused all-reduce + RMSNorm reduces

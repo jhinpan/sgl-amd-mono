@@ -8,11 +8,13 @@
 
 import math
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu
 from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
+from flydsl.expr.math import fma
 from flydsl.expr.typing import T
 
 from sgl_amd_mono.common.ops import (
@@ -28,7 +30,6 @@ from sgl_amd_mono.common.ops import (
     lane_gather,
     rsrc,
     sum_partials,
-    traced,
 )
 from sgl_amd_mono.common.plan import (
     THREADS,
@@ -78,10 +79,6 @@ def attn_region_pair(src, t, s, col):
     return (src * s + t) * (HIDDEN // 2) + col // 2
 
 
-def fma(a, b, c):
-    return fx.Float32(fmath.fma(a, b, c))
-
-
 def sigmoid(z):
     """Triton's ``tl.sigmoid``: 1 / (1 + exp2(-z log2(e)))."""
     return fx.Float32(1.0) / (fx.Float32(1.0) + hw_exp2(z * fx.Float32(-LOG2E)))
@@ -99,7 +96,7 @@ def pend_value(c, t, col, cc):
 
 
 # ---------------------------------------------------------------- slice
-@traced
+@flyc.jit
 def slice_input(c, task, idx):
     """Return thread ``idx``'s pair of the layer input."""
     s, rl = c["S"], c["rl"]
@@ -178,7 +175,7 @@ def slice_prefetch(c, task):
     return first, slice_fn_loads(c, task)
 
 
-@traced
+@flyc.jit
 def stage_slice(c, task, pre=None):
     """Compute R_new, the layer input and the partial projections of columns 32 task ..
     +32 (``pre``: ``slice_prefetch``'s loads)."""
@@ -214,7 +211,7 @@ def stage_slice(c, task, pre=None):
         slice_mix(c, task, t0, n)
 
 
-@traced
+@flyc.jit
 def slice_mix(c, task, t0, n):
     """The mix projection partials of tokens t0 .. t0 + n (``stage_slice``)."""
     s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
@@ -257,7 +254,7 @@ def _col(v, lane, q):
     return lane_f32(v, 8 + 4 * q + (lane - 8) % 4)
 
 
-@traced
+@flyc.jit
 def stage_gate(c, t):
     """Token t's 160 slices, in slice order, -> post / comb / next pre."""
     s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
@@ -322,7 +319,7 @@ def stage_gate(c, t):
 
 
 # ---------------------------------------------------------------- norm
-@traced
+@flyc.jit
 def stage_norm(c, t, store):
     """Token t's RMSNorm: rstd = rsq(fma(sum, 1/H, eps)), bf16((x rstd) w), handed to ``store``."""
     tid, lane, wave, red = c["tid"], c["lane"], c["wave"], c["red"]
@@ -368,7 +365,7 @@ def stage_norm(c, t, store):
         # rstd = 1 / sqrt_rn(sum / K + eps), IEEE division and sqrt
         tot = butterfly(fx.ptr_load(red + lane % 4), (2, 1))
         var = tot / fx.Float32(float(HIDDEN)) + fx.Float32(EPS)
-        r = fx.Float32(1.0) / fx.Float32(fmath.sqrt(var))
+        r = fx.Float32(1.0) / fmath.sqrt(var)
     else:
         tot = butterfly(fx.ptr_load(red + lane % 4), (1, 2))
         r = hw_rsq(fma(tot, fx.Float32(1.0 / HIDDEN), fx.Float32(EPS)))
@@ -379,7 +376,7 @@ def stage_norm(c, t, store):
 
 
 # ---------------------------------------------------------------- reduce
-@traced
+@flyc.jit
 def stage_reduce(c, task):
     """Sum the TP ranks' attention partials at this slice's 32 columns in rank order into ``pend_lds``."""
     s, tid = c["S"], c["tid"]
@@ -388,7 +385,7 @@ def stage_reduce(c, task):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def reduce_attn_pair(c, task, idx):
     """Thread ``idx``'s column pair of token idx / 16 (``stage_reduce``)."""
     s = c["S"]
@@ -408,7 +405,7 @@ def reduce_attn_pair(c, task, idx):
         fx.ptr_store(bf16_round(acc1), lds + 1)
 
 
-@traced
+@flyc.jit
 def stage_push(c, task, part):
     """Push this rank's attention partial at this slice's 32 columns to every rank's ATTN region."""
     s, tid, tp = c["S"], c["tid"], c["d"].tp

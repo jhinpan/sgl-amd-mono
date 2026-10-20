@@ -5,19 +5,18 @@
 The epoch buffer starts with the guard block (``guard.py``): the epoch, the
 wait deadline and the error words, then a mark per CTA."""
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu
-from flydsl.expr.typing import T, as_ir_value
+from flydsl.expr.typing import T
 
 from sgl_amd_mono.common.guard import GUARD_WORDS
 from sgl_amd_mono.common.ops import (
     CM_DEV,
+    global_ptr,
     rsrc,
-    traced,
 )
 from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.common.sync import _spin
@@ -29,16 +28,9 @@ def kernel_symbol(stem, **params):
     return f"_ZN5aiter{len(name)}{name}E"
 
 
-def _gptr(addr):
-    return llvm.IntToPtrOp(
-        ir.Type.parse("!llvm.ptr<1>"), as_ir_value(fx.Int64(addr))
-    ).result
-
-
 def gstore(addr, value, words=4):
     """Store ``words`` i32 (an Int32 or a Vector) at a 64-bit global address."""
-    v = as_ir_value(fx.Int32(value) if words == 1 else value)
-    llvm.StoreOp(v, _gptr(addr), alignment=4 * words)
+    fx.generic_store(global_ptr(addr, words), value)
 
 
 def spin_until(load, pending):
@@ -49,7 +41,7 @@ def spin_until(load, pending):
 EPOCH_MARKS = GUARD_WORDS  # word offset of the per-CTA marks, past the guard block
 
 
-@traced
+@flyc.jit
 def epoch_begin(c, epoch, ep):
     """Mark that this CTA read epoch ``ep``."""
     if c["tid"] == 0:
@@ -58,7 +50,7 @@ def epoch_begin(c, epoch, ep):
         )
 
 
-@traced
+@flyc.jit
 def epoch_end(c, epoch, ep, reset=None):
     """CTA 0: once every CTA marked the epoch, run ``reset()`` and move the epoch on."""
     if c["bid"] == 0:

@@ -3,12 +3,13 @@
 """K1's MXFP8 GEMV of a row-major e4m3 weight on the gfx950 scaled MFMA, and K2's
 GEMV of the same weight on bf16 rows (the weight widened to bf16 in registers)."""
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
-from sgl_amd_mono.common.ops import mfma_bf16, rsrc, traced
+from sgl_amd_mono.common.ops import mfma_bf16, rsrc
 from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import lds_row
 
 from .device import THREADS, WAVES, fp8x8_bf16, mfma_scaled, pow2, tile_map
@@ -84,17 +85,13 @@ def _step_mfma(c, nsteps, xl, xsl, st, ops, acc, live, rows, halves=False):
     av = fx.Vector.from_elements(
         [lo[d] for d in range(4)] + [hi[d] for d in range(4)], fx.Int32
     )
-    xlo = fx.Vector(
-        fx.ptr_load(
-            xl + (col * x_row + st * 32 + j * 4),
-            result_type=fx.Vector.make_type(4, fx.Int32),
-        )
+    xlo = fx.ptr_load(
+        xl + (col * x_row + st * 32 + j * 4),
+        result_type=fx.Vector.make_type(4, fx.Int32),
     )
-    xhi = fx.Vector(
-        fx.ptr_load(
-            xl + (col * x_row + st * 32 + 16 + j * 4),
-            result_type=fx.Vector.make_type(4, fx.Int32),
-        )
+    xhi = fx.ptr_load(
+        xl + (col * x_row + st * 32 + 16 + j * 4),
+        result_type=fx.Vector.make_type(4, fx.Int32),
     )
     xv = fx.Vector.from_elements(
         [xlo[d] for d in range(4)] + [xhi[d] for d in range(4)], fx.Int32
@@ -102,9 +99,7 @@ def _step_mfma(c, nsteps, xl, xsl, st, ops, acc, live, rows, halves=False):
     sb = fx.ptr_load(xsl + (col * s_row + st * 4 + j))
     if const_expr(live is not None):
         # a step past the end adds zero at unit scale
-        av = fx.Vector.from_elements(
-            [live.select(av[d], fx.Int32(0)) for d in range(8)], fx.Int32
-        )
+        av = live.select(av, fx.Vector.filled(8, 0, fx.Int32))
         sa = live.select(sa, fx.Int32(127))
         sb = live.select(sb, fx.Int32(127))
     if const_expr(halves):
@@ -128,10 +123,7 @@ def gemv_mfmas(c, k, xl, xsl, red, ops, split=None, tiled=False, rows=16, nsteps
     for i, (st, live) in enumerate(_steps(c, nsteps, split, tiled)):
         acc = _step_mfma(c, nsteps, xl, xsl, st, ops[i], acc, live, rows)
     if const_expr(split is not None and not tiled):
-        acc = fx.Vector.from_elements(
-            [(wave < split).select(acc[e], fx.Float32(0.0)) for e in range(4)],
-            fx.Float32,
-        )
+        acc = (wave < split).select(acc, fx.Vector.filled(4, 0.0, fx.Float32))
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
 
 
@@ -172,9 +164,7 @@ def chain_mfmas(c, xl, xsl, ops, rows, nsteps, slots, halves=False):
         for (st, live), op in zip(steps, sops):
             loc = fx.min(st, nsteps - 1)
             new = _step_mfma(c, nsteps, xl, xsl, loc, op, acc, None, rows, halves)
-            acc = fx.Vector.from_elements(
-                [live.select(new[e], acc[e]) for e in range(4)], fx.Float32
-            )
+            acc = live.select(new, acc)
         out.append(acc)
     return out
 
@@ -242,7 +232,7 @@ def rows_loads(
     return out
 
 
-@traced
+@flyc.jit
 def _store_span(c, regs, width, dst, n, lrow=None):
     tid = c["tid"]
     wq, rpr, _ = span_items(width, n)
@@ -330,11 +320,9 @@ def bf16_gemv_mfmas(c, k, xl, ops, acc, h, rows):
             (hi[0], hi[1], s_hi, 64 + 16 * j),
             (hi[2], hi[3], s_hi, 64 + 16 * j + 8),
         ):
-            xv = fx.Vector(
-                fx.ptr_load(
-                    xl + (col * x_row + (k0 + kk) // 2),
-                    result_type=fx.Vector.make_type(4, fx.Int32),
-                )
+            xv = fx.ptr_load(
+                xl + (col * x_row + (k0 + kk) // 2),
+                result_type=fx.Vector.make_type(4, fx.Int32),
             )
             wv = fp8x8_bf16(w0, w1, sc)
             acc = mfma_bf16(wv.bitcast(fx.BFloat16), xv.bitcast(fx.BFloat16), acc)

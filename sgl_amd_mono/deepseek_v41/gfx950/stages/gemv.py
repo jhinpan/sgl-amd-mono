@@ -5,6 +5,7 @@
 # atom/models/deepseek_v41/mono/kernels/attn_pre.py (its GEMV and LDS helpers).
 """FP8 GEMV tiles and data movement shared by the seam and MoE stages."""
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, range_constexpr
@@ -18,7 +19,6 @@ from sgl_amd_mono.common.ops import (
     CM_NT,
     fresh,
     rsrc,
-    traced,
 )
 from sgl_amd_mono.common.plan import WAVES
 from sgl_amd_mono.common.sync import POLL_MAX
@@ -128,17 +128,13 @@ def _fp8_step_mfma(c, k, xl, xsl, st, ops, acc, live=None, rows=None):
         fx.Int32,
     )
     grp = st * 4 + j
-    xlo = fx.Vector(
-        fx.ptr_load(
-            xl + (col * x_row + st * 32 + j * 4),
-            result_type=fx.Vector.make_type(4, fx.Int32),
-        )
+    xlo = fx.ptr_load(
+        xl + (col * x_row + st * 32 + j * 4),
+        result_type=fx.Vector.make_type(4, fx.Int32),
     )
-    xhi = fx.Vector(
-        fx.ptr_load(
-            xl + (col * x_row + st * 32 + 16 + j * 4),
-            result_type=fx.Vector.make_type(4, fx.Int32),
-        )
+    xhi = fx.ptr_load(
+        xl + (col * x_row + st * 32 + 16 + j * 4),
+        result_type=fx.Vector.make_type(4, fx.Int32),
     )
     if const_expr(k % 64 != 0):
         over = 4 * st + j // 2 >= kg
@@ -207,15 +203,12 @@ def gemv_fp8_mfmas(c, k, xl, xsl, red, ops, split=None, tiled=False, rows=None):
     for i, (st, live) in enumerate(_gemv_steps(c, k, split, tiled)):
         acc = _fp8_step_mfma(c, k, xl, xsl, st, ops[i], acc, live, rows)
     if const_expr(split is not None and not tiled):
-        acc = fx.Vector.from_elements(
-            [(wave < split).select(acc[e], fx.Float32(0.0)) for e in range(4)],
-            fx.Float32,
-        )
+        acc = (wave < split).select(acc, fx.Vector.filled(4, 0.0, fx.Float32))
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
 
 
 # ---------------------------------------------------------------- mailbox -> LDS
-@traced
+@flyc.jit
 def poll_copy(c, idx, width, spans, live=None):
     """Copy mailbox spans into LDS, POLL_MAX pairs a round trip."""
     idx = fresh(idx)  # its elements' indices not hoisted out of a task loop
@@ -239,7 +232,7 @@ def poll_copy(c, idx, width, spans, live=None):
                 _poll_store_batches(c, chunks[b0 : b0 + POLL_MAX])
 
 
-@traced
+@flyc.jit
 def _poll_store_batches(c, chunks):
     """Copy ``poll_copy``'s chunks into LDS, POLL_MAX pairs a round trip."""
     for b0 in range_constexpr(0, len(chunks), POLL_MAX):

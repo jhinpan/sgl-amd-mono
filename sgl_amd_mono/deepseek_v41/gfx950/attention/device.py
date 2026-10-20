@@ -4,14 +4,11 @@
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr
 from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
-from sgl_amd_mono.common.epoch import _gptr
 from sgl_amd_mono.common.ops import bf16_pair, rsrc
 from sgl_amd_mono.common.sync import _spin
 
@@ -54,7 +51,7 @@ def tile_map(tid, width):
 
 
 def fma(a, b, c):
-    return fx.Float32(fmath.fma(fx.Float32(a), fx.Float32(b), fx.Float32(c)))
+    return fmath.fma(fx.Float32(a), fx.Float32(b), fx.Float32(c))
 
 
 def div_rn(x, d, r):
@@ -180,15 +177,6 @@ class Mailbox:
 
 
 # ----------------------------------------------------------------------------- K2
-
-
-def gload(addr, words=4, nt=False):
-    """``words`` i32 (1, 2 or 4) at a 64-bit global address: a cache past 4 GiB is
-    reachable only this way (a buffer offset is 32 bits)."""
-    i32 = ir.IntegerType.get_signless(32)
-    ty = i32 if words == 1 else ir.VectorType.get([words], i32)
-    v = llvm.LoadOp(ty, _gptr(addr), alignment=4 * words, nontemporal=nt or None).result
-    return fx.Int32(v) if words == 1 else fx.Vector(v)
 
 
 def pow2(code):

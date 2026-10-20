@@ -44,6 +44,28 @@ from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.epoch import kernel_symbol, spin_until
+from sgl_amd_mono.common.ops import (
+    bpermute_i32,
+    div_rn,
+    fp8_pack4,
+)
+from sgl_amd_mono.common.ops import fp8_to_bf16x8 as _fp8_to_bf16x8
+from sgl_amd_mono.common.ops import hw_exp as _exp
+from sgl_amd_mono.common.ops import hw_rcp as _rcp
+from sgl_amd_mono.common.ops import hw_rsq as _rsq
+from sgl_amd_mono.common.ops import (
+    read_lane_i32,
+)
+from sgl_amd_mono.common.ops import rsrc as _rsrc
+from sgl_amd_mono.common.ops import uniform as _uniform
+from sgl_amd_mono.common.ops import uniform_f32 as _uniform_f32
+from sgl_amd_mono.common.ops import (
+    wave_max,
+    wave_umax,
+    write_lane_i32,
+)
+from sgl_amd_mono.common.ops import xred as _xred
+from sgl_amd_mono.common.ops import xshfl as _xshfl
 from sgl_amd_mono.common.plan import kernel_sources, key_tuple
 
 from .config import (
@@ -114,29 +136,6 @@ from .layout import (
     stage_tasks,
     ug_task_rounds,
 )
-from .ops import (
-    bpermute_i32,
-    div_rn,
-)
-from .ops import exp as _exp
-from .ops import (
-    fp8_pack4,
-)
-from .ops import fp8_to_bf16x8 as _fp8_to_bf16x8
-from .ops import rcp as _rcp
-from .ops import (
-    read_lane_i32,
-)
-from .ops import rsq as _rsq
-from .ops import rsrc as _rsrc
-from .ops import uniform as _uniform
-from .ops import uniform_f32 as _uniform_f32
-from .ops import (
-    wave_umax_dpp,
-    write_lane_i32,
-)
-from .ops import xred as _xred
-from .ops import xshfl as _xshfl
 from .tiles import (
     BLOCKS,
     CM_DEV,
@@ -570,11 +569,8 @@ def build_flash_kernel(key: FlashBuild):
             def lds_mxfp8(chunk_word):
                 """One scaled-MFMA B operand from a row-major 128-value MXFP8 tile."""
                 words = [
-                    fx.Vector(
-                        fx.ptr_load(
-                            xs + chunk_word + 16 * half + 4 * (lane // 16),
-                            result_type=v4f,
-                        )
+                    fx.ptr_load(
+                        xs + chunk_word + 16 * half + 4 * (lane // 16), result_type=v4f
                     ).bitcast(fx.Int32)
                     for half in range(2)
                 ]
@@ -808,8 +804,8 @@ def build_flash_kernel(key: FlashBuild):
                 ids = ids + [fx.Int32(N_EXPERTS)]
                 mv = fx.Int32(0)  # lane k: the expert ID of pick k
                 for k in range_constexpr(TOP_K):
-                    m = wave_umax_dpp(ks[0])
-                    winner = wave_umax_dpp(
+                    m = wave_umax(ks[0])
+                    winner = wave_umax(
                         (ks[0] == m).select(ID_BASE - ids[0], fx.Int32(0))
                     )
                     expert = ID_BASE - winner
@@ -1331,7 +1327,7 @@ def build_flash_kernel(key: FlashBuild):
                             for j in range_constexpr(CONV_TAPS - 1):
                                 nxt = st[j + 1] if j + 1 < CONV_TAPS - 1 else x
                                 bo.buffer_store(
-                                    fx.Float32(nxt).to(fx.BFloat16),
+                                    nxt.to(fx.BFloat16),
                                     r_cs,
                                     conv_at(ch, j),
                                 )
@@ -1486,11 +1482,6 @@ def build_flash_kernel(key: FlashBuild):
             def start_at(b):
                 """First task of a stage whose task 0 runs on CTA ``b``."""
                 return (bid + (G - b % G)) & (G - 1)
-
-            def wave_max(v):
-                for sh in range_constexpr(6):
-                    v = _xred(v, 32 >> sh, fx.max)
-                return v
 
             def unit_fp8_rm(
                 w_rsrc, s_rsrc, row0, kb, K, rows, b_word, scale_cols, shuffled
@@ -1703,7 +1694,7 @@ def build_flash_kernel(key: FlashBuild):
                             fx.Int64(slot // KVB) * KVE + fx.Int64((slot % KVB) * KVR)
                         ) * fx.Int64(2)
                         bo.buffer_store(
-                            fx.Float32(kv * rstd * g).to(fx.BFloat16),
+                            (kv * rstd * g).to(fx.BFloat16),
                             _rsrc(row_addr),
                             tid,
                         )
@@ -2043,11 +2034,9 @@ def build_flash_kernel(key: FlashBuild):
                                 for hh in range_constexpr(INDEX_HEADS // 16):
                                     hq = hh * 16 + lane % 16
                                     qb = [
-                                        fx.Vector(
-                                            fx.ptr_load(
-                                                xs + (hq * QW8 + 8 * g4 + 4 * h),
-                                                result_type=v4f,
-                                            )
+                                        fx.ptr_load(
+                                            xs + (hq * QW8 + 8 * g4 + 4 * h),
+                                            result_type=v4f,
                                         ).bitcast(fx.Int32)
                                         for h in range(2)
                                     ]

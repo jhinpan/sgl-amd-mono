@@ -18,6 +18,7 @@ One launch a layer and rank, ``BLOCKS`` x ``THREADS``, S rows:
 Hand-offs are plain device-scope data behind tagged flags.
 """
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 import msgspec
 from aiter.ops.flydsl.kernels import buffer_ops as bo
@@ -33,12 +34,12 @@ from sgl_amd_mono.common.ops import (
     butterfly,
     fp8_pack4,
     fresh,
+    global_load,
     hw_exp2,
     lane_gather,
     mfma_bf16,
     row_sum,
     rsrc,
-    traced,
     xshfl,
 )
 from sgl_amd_mono.common.plan import (
@@ -52,7 +53,7 @@ from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import (
     lds_row,
 )
 
-from .device import Mailbox, fp8x8_bf16, gload, ld_i32, mx_code, mx_mul, pow2, stamp
+from .device import Mailbox, fp8x8_bf16, ld_i32, mx_code, mx_mul, pow2, stamp
 from .gemv import (
     RED,
     bf16_gemv_loads,
@@ -121,7 +122,7 @@ def p_row(d: Dims, s: int) -> int:
     return chunk_keys(d, s) // 2 + P_PAD
 
 
-@traced
+@flyc.jit
 def publish(c, region, i):
     """This CTA's stores visible device-wide, then the flag pair (region, i)."""
     rocdl.s_waitcnt(vmcnt=0)
@@ -130,7 +131,7 @@ def publish(c, region, i):
         c["mb"].put(region, i, fx.Int32(1))
 
 
-@traced
+@flyc.jit
 def await_flags(c, region, n, index):
     """Thread u < n polls flag ``index(u)``; then the CTA proceeds."""
     tid = c["tid"]
@@ -186,7 +187,7 @@ def _fp8_pair_f32(word, scale, hi):
 # ---------------------------------------------------------------- split
 
 
-@traced
+@flyc.jit
 def stage_split(c, unit):
     """Flash-decoding over chunk ``unit % nchunk`` of token ``unit // nchunk``,
     every head of the rank -> the chunk's partial and (max, sum) per head. Wave
@@ -232,13 +233,13 @@ def stage_split(c, unit):
     if k0 < kv_len:
         # a key's 448 e4m3 as 7 x 16 B (lane g: dims 64 c + 16 g ..), its 64
         # bf16 rope dims as 2 x 16 B (32 c + 8 g ..), its 7 scale bytes
-        scw = gload(sc, words=2)
+        scw = global_load(sc, words=2)
         nope = [
-            gload(data + fx.Int64(64 * c4 + 16 * g), words=4)
+            global_load(data + fx.Int64(64 * c4 + 16 * g), words=4)
             for c4 in range(NOPE // 64)
         ]
         rope = [
-            gload(data + fx.Int64(NOPE + (cc * 32 + 8 * g) * 2), words=4)
+            global_load(data + fx.Int64(NOPE + (cc * 32 + 8 * g) * 2), words=4)
             for cc in range(ROPE // 32)
         ]
         # q of every head into LDS (bf16 rows of 512 + pad), 16 B a thread
@@ -265,7 +266,7 @@ def stage_split(c, unit):
         # QK: A = the keys (dequantized once), B = q of a head tile (LDS); the
         # contraction's 32-dim chunk 2 c + h of the nope dims is {64 c + 16 g +
         # 8 h ..} (lane g's 16 B load), q read in the same order
-        scale = fx.Int32(a["qk_scale"]).bitcast(fx.Float32)
+        scale = a["qk_scale"].bitcast(fx.Float32)
         st = sl["st"]
         accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(nht)]
         for c4 in range_constexpr(NOPE // 64):
@@ -276,22 +277,18 @@ def stage_split(c, unit):
                 )
                 for ht in range_constexpr(nht):
                     qb = sl["q"] + ((hgi * nht + ht) * HEAD_TILE + r16) * Q_ROW
-                    qw = fx.Vector(
-                        fx.ptr_load(
-                            qb + 32 * c4 + 8 * g + 4 * h2,
-                            result_type=fx.Vector.make_type(4, fx.Int32),
-                        )
+                    qw = fx.ptr_load(
+                        qb + 32 * c4 + 8 * g + 4 * h2,
+                        result_type=fx.Vector.make_type(4, fx.Int32),
                     )
                     accs[ht] = mfma_bf16(kw, qw.bitcast(fx.BFloat16), accs[ht])
         for cc in range_constexpr(ROPE // 32):
             kw = rope[cc].bitcast(fx.BFloat16)
             for ht in range_constexpr(nht):
                 qb = sl["q"] + ((hgi * nht + ht) * HEAD_TILE + r16) * Q_ROW
-                qw = fx.Vector(
-                    fx.ptr_load(
-                        qb + (NOPE + cc * 32 + 8 * g) // 2,
-                        result_type=fx.Vector.make_type(4, fx.Int32),
-                    )
+                qw = fx.ptr_load(
+                    qb + (NOPE + cc * 32 + 8 * g) // 2,
+                    result_type=fx.Vector.make_type(4, fx.Int32),
                 )
                 accs[ht] = mfma_bf16(kw, qw.bitcast(fx.BFloat16), accs[ht])
         # scores of keys 4 g + i (C rows), head r16 of a tile (C column)
@@ -301,8 +298,7 @@ def stage_split(c, unit):
         svs = []
         for ht in range_constexpr(nht):
             sv = [
-                fx.Float32(valid[i].select(accs[ht][i] * scale, fx.Float32(NEG)))
-                for i in range(4)
+                valid[i].select(accs[ht][i] * scale, fx.Float32(NEG)) for i in range(4)
             ]
             mw = butterfly(
                 fx.max(fx.max(sv[0], sv[1]), fx.max(sv[2], sv[3])), (32, 16), fx.max
@@ -318,10 +314,7 @@ def stage_split(c, unit):
             for j in range_constexpr(1, nkt):
                 m = fx.max(m, fx.ptr_load(st + (hti * nkt + j) * HEAD_TILE + r16))
             sv = svs[ht]
-            p = [
-                fx.Float32(valid[i].select(hw_exp2(sv[i] - m), fx.Float32(0.0)))
-                for i in range(4)
-            ]
+            p = [valid[i].select(hw_exp2(sv[i] - m), fx.Float32(0.0)) for i in range(4)]
             lw = (p[0] + p[2]) + (p[1] + p[3])
             lw = lw + xshfl(lw, 32)
             lw = lw + xshfl(lw, 16)
@@ -366,11 +359,9 @@ def stage_split(c, unit):
             if is_rope:
                 rv = []
                 for j in range_constexpr(4):
-                    rw = fx.Vector(
-                        fx.ptr_load(
-                            rb0 + j * (REC // 4) + (NOPE + 8 * r16) // 4,
-                            result_type=fx.Vector.make_type(2, fx.Int32),
-                        )
+                    rw = fx.ptr_load(
+                        rb0 + j * (REC // 4) + (NOPE + 8 * r16) // 4,
+                        result_type=fx.Vector.make_type(2, fx.Int32),
                     )
                     rv.append([bf_lo(rw[0]), bf_hi(rw[0]), bf_lo(rw[1]), bf_hi(rw[1])])
                 vv = fx.Vector.from_elements(
@@ -380,8 +371,8 @@ def stage_split(c, unit):
                 nv = []
                 for j in range_constexpr(4):
                     rb = rb0 + j * (REC // 4)
-                    w = fx.Int32(fx.ptr_load(rb + (dbase + 4 * r16) // 4))
-                    scb = fx.Int32(fx.ptr_load(rb + DATA // 4 + wave // 4))
+                    w = fx.ptr_load(rb + (dbase + 4 * r16) // 4)
+                    scb = fx.ptr_load(rb + DATA // 4 + wave // 4)
                     scl = pow2((scb >> sh) & 0xFF)
                     nv.append(
                         _fp8_pair_f32(w, scl, False) + _fp8_pair_f32(w, scl, True)
@@ -390,13 +381,11 @@ def stage_split(c, unit):
                     [nv[j][dt] for dt in range(4) for j in range(4)], fx.Float32
                 )
             for ht2 in range_constexpr(d.head_tiles):
-                pb = fx.Vector(
-                    fx.ptr_load(
-                        sl["p"]
-                        + (ht2 * HEAD_TILE + r16) * p_row(d, s)
-                        + (kt2 * 16 + 4 * g) // 2,
-                        result_type=fx.Vector.make_type(2, fx.Int32),
-                    )
+                pb = fx.ptr_load(
+                    sl["p"]
+                    + (ht2 * HEAD_TILE + r16) * p_row(d, s)
+                    + (kt2 * 16 + 4 * g) // 2,
+                    result_type=fx.Vector.make_type(2, fx.Int32),
                 ).bitcast(fx.Int16)
                 for dt in range_constexpr(4):
                     av = (
@@ -441,7 +430,7 @@ def stage_split(c, unit):
 COMB_HEADS = WAVES  # heads a combine unit: a wave each
 
 
-@traced
+@flyc.jit
 def stage_combine(c, unit):
     """(token, 8 heads) ``unit``, a wave a head, 8 dims a lane: the chunks
     merged with the sink folded in, bf16, inverse RoPE, bf16 -> XO (the normal
@@ -495,13 +484,13 @@ def stage_combine(c, unit):
                 dtype=T.i32,
             )
         )
-        mc = fx.Float32(live.select(stv[0], fx.Float32(NEG)))
+        mc = live.select(stv[0], fx.Float32(NEG))
         ms.append(mc)
-        ls.append(fx.Float32(live.select(stv[1], fx.Float32(0.0))))
+        ls.append(live.select(stv[1], fx.Float32(0.0)))
         vals = []
         for e in range_constexpr(4):
             vals += [bf_lo(pv[e]), bf_hi(pv[e])]
-        vs.append([fx.Float32(live.select(v, fx.Float32(0.0))) for v in vals])
+        vs.append([live.select(v, fx.Float32(0.0)) for v in vals])
         m = fx.max(m, mc)
     m_final = fx.max(m, sink)
     lsum = hw_exp2(sink - m_final)
@@ -535,7 +524,7 @@ def stage_combine(c, unit):
 # ---------------------------------------------------------------- wo_a / wo_b
 
 
-@traced
+@flyc.jit
 def stage_woa(c, task, acc, t0, n):
     """Rows 32 task .. of wo_a from the waves' accumulators (``bf16_gemv_mfmas``)
     -> bf16 -> vLLM's MXFP8 of the 32 -> X8B, wo_b's input."""
@@ -589,7 +578,7 @@ def _wob_store(a, t, col, v0, v1):
     bo.buffer_store(word, rsrc(a["out"]), (t * a["out_stride"] + col) // 2)
 
 
-@traced
+@flyc.jit
 def stage_wob(c, task, ops, task2, ops2, has2, t0, n, mark=False):
     """Rows 16 task .. (and 16 task2 .., ``has2``) of wo_b -> bf16 -> out, or
     (``c["wob_out"]``, the mono layer) the caller's hook with each bf16 pair."""
@@ -707,7 +696,7 @@ def back_context(key, lds, args: dict, scratch, tag, layout: dict) -> dict:
     return c
 
 
-@traced
+@flyc.jit
 def run_back(c, key, bid):
     """The attention back's stages on this CTA: split, combine, wo_a, wo_b."""
     s = key.tokens

@@ -25,7 +25,6 @@ from sgl_amd_mono.common.ops import (
     fp8_pack4,
     peer_bases,
     rsrc,
-    traced,
 )
 from sgl_amd_mono.common.plan import (
     BLOCKS,
@@ -155,7 +154,7 @@ def _epoch(epoch):
 # ---------------------------------------------------------------- K1
 
 
-@traced
+@flyc.jit
 def store_x8(c, t, col, ys, live):
     """Store the seam's norm output at ``col`` as MXFP8 X8 / X8S for the front."""
     amax = abs(ys[0])
@@ -178,7 +177,7 @@ def store_x8(c, t, col, ys, live):
             )
 
 
-@traced
+@flyc.jit
 def publish_x8(c, t):
     """Token t's two XRDY flags (one a wqkv K half) once its X8 / X8S landed."""
     rocdl.s_waitcnt(vmcnt=0)
@@ -473,7 +472,7 @@ def build_mono_k1(key: MonoBuild):
 # ---------------------------------------------------------------- the FFN launch
 
 
-@traced
+@flyc.jit
 def store_normed(normed, t, col, ys, live):
     """Store the FFN seam's norm output as the MoE input row (bf16, device scope)."""
     if live:
@@ -497,7 +496,7 @@ def _seam_lds(s):
     return SeamLds
 
 
-@traced
+@flyc.jit
 def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
     """Run the FFN seam, the MoE, its all-reduce into ``a["out"]``, and the epoch update."""
     s, tp = key.tokens, key.tp

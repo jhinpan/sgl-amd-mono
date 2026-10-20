@@ -20,6 +20,7 @@ selector then finds the scores in place instead of scoring after its launch.
 import struct
 from typing import NamedTuple
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.kernels_common import LOG2E
@@ -28,11 +29,11 @@ from flydsl.expr.typing import T
 
 from sgl_amd_mono.common.ops import (
     butterfly,
+    fp8_to_bf16x8,
     lane_gather,
     mfma_bf16,
     permlane_swap,
     rsrc,
-    traced,
     uniform,
 )
 from sgl_amd_mono.minimax_m3.gfx950.config import (
@@ -49,7 +50,7 @@ from sgl_amd_mono.minimax_m3.gfx950.config import (
     WAVES,
     IndexHeads,
 )
-from sgl_amd_mono.minimax_m3.gfx950.device import fp8x8_bf16_pk, readlane, unlikely
+from sgl_amd_mono.minimax_m3.gfx950.device import readlane, unlikely
 
 INDEX_BLOCK_BYTES = SPARSE_BLOCK * HEAD_DIM  # one fp8 index-K block
 KEY_TILES = SPARSE_BLOCK // 16  # MFMA row tiles of a block
@@ -114,7 +115,7 @@ def _pick(vals, k):
     return v
 
 
-@traced
+@flyc.jit
 def emit_index_scores(
     slot, lane, wave, red, mb_put, iscore, q_frag, tokens, q_len, init_blocks,
     local_blocks, scale, index_cache, block_table, seq_lens, bt_width,
@@ -240,7 +241,7 @@ def emit_index_scores(
         for n, i in enumerate(tiles):
             c = fx.Vector.filled(4, 0.0, fx.Float32)
             for s in range_constexpr(HEAD_DIM // 32):
-                c = mfma_bf16(fp8x8_bf16_pk(kw[n][s]), qb[s], c)
+                c = mfma_bf16(fp8_to_bf16x8(*kw[n][s]), qb[s], c)
             # lane holds keys 16 i + 4 (lane / 16) + e of column lane % 16
             key0 = b * SPARSE_BLOCK + 16 * i + 4 * g4
             for e in range_constexpr(4):

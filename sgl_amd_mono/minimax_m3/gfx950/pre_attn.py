@@ -20,6 +20,7 @@ RoPE and reduction orders follow the aiter kernels the unfused path uses (see ea
 stage); the qkv / index GEMV is FP8 where the unfused path's is bf16.
 """
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu
@@ -36,8 +37,8 @@ from sgl_amd_mono.common.ops import (
     fp8_pack4,
     hw_rsq,
     rsrc,
-    traced,
     uniform,
+    wave_max,
 )
 from sgl_amd_mono.minimax_m3.gfx950.config import (
     BLOCKS,
@@ -61,7 +62,6 @@ from sgl_amd_mono.minimax_m3.gfx950.device import (
     readlane,
     release_stores,
     step_tag,
-    wave_max,
 )
 from sgl_amd_mono.minimax_m3.gfx950.index_score import emit_index_scores, step_rows
 from sgl_amd_mono.minimax_m3.gfx950.reduction import ar_block_sums
@@ -158,8 +158,8 @@ def head_norm_rope(e, lane, gw4, cs, sn, eps):
         p = fx.Int32(
             rocdl.ds_bpermute(
                 T.i32,
-                (fx.min(fx.max(partner_lane, 0), 63) * 4).ir_value(),
-                n[j].bitcast(fx.Int32).ir_value(),
+                fx.min(fx.max(partner_lane, 0), 63) * 4,
+                n[j].bitcast(fx.Int32),
             )
         ).bitcast(fx.Float32)
         # hipcc contracts ``x*c - p*s`` into fma(x, c, -(p*s)); match it
@@ -169,7 +169,7 @@ def head_norm_rope(e, lane, gw4, cs, sn, eps):
     return out
 
 
-@traced
+@flyc.jit
 def emit_pre_attn(
     tid, bid, lane, wave, x8, red, mb_put, mb_put_words, mb_poll, qkv_mb, x8_mb,
     x8s_mb, eps, tokens, heads, ptrs, signal, long_step=None,
@@ -315,11 +315,9 @@ def emit_pre_attn(
             for i in range_constexpr(2):
                 if (i == 0) | (lane < 32):
                     bo.buffer_store(
-                        fx.Vector(
-                            fx.ptr_load(
-                                x8 + lts[i] * 2,
-                                result_type=fx.Vector.make_type(2, fx.Int32),
-                            )
+                        fx.ptr_load(
+                            x8 + lts[i] * 2,
+                            result_type=fx.Vector.make_type(2, fx.Int32),
                         ),
                         rsrc(x8_mb),
                         tk * (HIDDEN // 4) + lts[i] * 2,
@@ -419,11 +417,9 @@ def emit_pre_attn(
         c = fx.Vector.filled(4, 0.0, fx.Float32)
         for cc in range_constexpr(CHUNKS_PER_WAVE):
             kc = wave * CHUNKS_PER_WAVE + cc
-            xb = fx.Vector(
-                fx.ptr_load(
-                    x8 + (col_tok * (HIDDEN // 4) + kc * 16 + (lane // 16) * 4),
-                    result_type=fx.Vector.make_type(4, fx.Float32),
-                )
+            xb = fx.ptr_load(
+                x8 + (col_tok * (HIDDEN // 4) + kc * 16 + (lane // 16) * 4),
+                result_type=fx.Vector.make_type(4, fx.Float32),
             ).bitcast(fx.Int64)
             wa = wts[cc].bitcast(fx.Int64)
             for h in range_constexpr(2):
@@ -571,7 +567,7 @@ K1_ARGS = (
 )  # fmt: skip
 
 
-@traced
+@flyc.jit
 def emit_k1(
     tid, bid, lane, wave, x8, red, qs, step, layer, eps, index_scale, tokens,
     q_len, init_blocks, local_blocks, heads, ptrs, bt_width,
@@ -633,11 +629,9 @@ def emit_k1(
         """This lane's MFMA B operand of token tk's index q of head ``head``,
         k-chunk s."""
         row = (tk * heads.count + head) * (HEAD_DIM // 2)
-        return fx.Vector(
-            fx.ptr_load(
-                qs + (row + (32 * s + 8 * (lane // 16)) // 2),
-                result_type=fx.Vector.make_type(4, fx.Float32),
-            )
+        return fx.ptr_load(
+            qs + (row + (32 * s + 8 * (lane // 16)) // 2),
+            result_type=fx.Vector.make_type(4, fx.Float32),
         ).bitcast(fx.BFloat16)
 
     def q_frag(tk, s):

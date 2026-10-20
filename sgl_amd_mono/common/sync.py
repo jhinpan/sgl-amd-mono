@@ -7,6 +7,7 @@
 
 from enum import Enum
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 import msgspec
 from aiter.ops.flydsl.kernels import buffer_ops as bo
@@ -19,14 +20,13 @@ from sgl_amd_mono.common.ops import (
     CM_SYS,
     bf16_pair,
     rsrc,
-    traced,
 )
 
 POLL_MAX = 12  # mailbox specs polled per batch (bounds live registers)
 CHECK_POLLS = 64  # a pending wait checks its deadline and the failure flags this often
 
 
-@traced
+@flyc.jit
 def _spin(load_all, pending):
     """Re-issue ``load_all`` until ``pending`` clears.
 
@@ -188,7 +188,7 @@ class Mailbox:
         return outs
 
 
-@traced
+@flyc.jit
 def publish(put, a, i, v, who):
     """Drain this CTA's plain stores, then store mailbox pair (``a``, i) := v from thread ``who``."""
     rocdl.s_waitcnt(vmcnt=0)

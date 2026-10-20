@@ -32,6 +32,7 @@ arithmetic, step for step (relu as x + |x| against half the weight, the
 lane's heads in one fma chain, then the swaps): its logits bit for bit.
 """
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl._mlir import ir
@@ -48,7 +49,6 @@ from sgl_amd_mono.common.ops import (
     ld_i32,
     permlane_swap,
     rsrc,
-    traced,
 )
 from sgl_amd_mono.common.plan import BLOCKS, WAVES
 
@@ -97,7 +97,7 @@ def _sload4(addr):
     address space): the scalar cache's round trip, not the vector memory's."""
     ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<4>"), as_ir_value(addr)).result
     v = fx.Vector(llvm.LoadOp(T.vec(4, T.i32), ptr, alignment=16).result)
-    return [fx.Int32(v[k]) for k in range(4)]
+    return [v[k] for k in range(4)]
 
 
 def _read_all(args):
@@ -118,12 +118,12 @@ def _swap_add(off, x, y):
 def _lds_barrier():
     """A barrier for an LDS hand-off only: ``gpu.barrier`` would also wait on
     the walk's first reads, issued ahead of it to overlap it."""
-    llvm.fence(llvm.AtomicOrdering.release, syncscope="workgroup")
+    fx.memory_fence(ordering=fx.AtomicOrdering.Release, syncscope="workgroup")
     rocdl.s_barrier()
-    llvm.fence(llvm.AtomicOrdering.acquire, syncscope="workgroup")
+    fx.memory_fence(ordering=fx.AtomicOrdering.Acquire, syncscope="workgroup")
 
 
-@traced
+@flyc.jit
 def _stage_rows(c, lead, span, first_keys=None):
     """The piece's rows into LDS, read once a CTA (every wave reading its own
     copy put the CTA's waves on the same lines at once): thread u <
@@ -174,11 +174,11 @@ def _stage_rows(c, lead, span, first_keys=None):
         if const_expr(first_keys is not None):
             init = first_keys()
         for r in range_constexpr(ip.WALK_ROWS):
-            v = fx.Vector(got[r])
-            wa = fx.Int32(low_half.select(fx.Int32(v[0]), fx.Int32(v[2])))
-            wb = fx.Int32(low_half.select(fx.Int32(v[1]), fx.Int32(v[3])))
+            v = got[r]
+            wa = low_half.select(v[0], v[2])
+            wb = low_half.select(v[1], v[3])
             wide = (wa << 16, wa & -65536, wb << 16, wb & -65536)
-            words = [fx.Int32(is_w.select(wide[e], fx.Int32(v[e]))) for e in range(4)]
+            words = [is_w.select(wide[e], v[e]) for e in range(4)]
             fx.ptr_store(
                 fx.Vector.from_elements(words, fx.Int32),
                 lds + (r * ROW_WORDS + u * 4),
@@ -200,18 +200,16 @@ def _rows(c, rows):
     out = []
     for r in range_constexpr(rows):
         row = lds + r * ROW_WORDS
-        bound = fx.Int32(fx.ptr_load(lds + (BOUNDS_AT + r)))
+        bound = fx.ptr_load(lds + (BOUNDS_AT + r))
         q = [
-            fx.Vector(fx.ptr_load(row + ((mi * 16 + l) * 16 + g * 4), result_type=v4))
+            fx.ptr_load(row + ((mi * 16 + l) * 16 + g * 4), result_type=v4)
             for mi in range(M_TILES)
         ]
-        qs = fx.Int32(fx.ptr_load(row + (Q_WORDS + g * 16 + l)))
+        qs = fx.ptr_load(row + (Q_WORDS + g * 16 + l))
         w = []
         for mi in range_constexpr(M_TILES):
-            w4 = fx.Vector(
-                fx.ptr_load(
-                    row + (Q_WORDS + QS_WORDS + mi * 16 + g * 4), result_type=v4
-                )
+            w4 = fx.ptr_load(
+                row + (Q_WORDS + QS_WORDS + mi * 16 + g * 4), result_type=v4
             ).bitcast(fx.Float32)
             w.append([w4[e] * fx.Float32(0.5) for e in range(4)])
         out.append((bound, q, qs, w))
@@ -248,19 +246,17 @@ def _keys(c, page, nt):
         + phys * PLANE_PAGE_BYTES
         + fx.Int64(g * PLANE_CHUNK_BYTES + (sub * 8 + (l % 2) * 4) * 16)
     )
-    kv = [fx.Vector(global_load(base + t * 16, 4, nt)) for t in range(4)]
-    line = fx.Vector(
-        global_load(
-            a["pscale"]
-            + phys * PLANE_PAGE_SCALES
-            + fx.Int64(g * 64 + (sub % 2) * 32 + (l % 2) * 16),
-            4,
-        )
+    kv = [global_load(base + t * 16, 4, nt) for t in range(4)]
+    line = global_load(
+        a["pscale"]
+        + phys * PLANE_PAGE_SCALES
+        + fx.Int64(g * 64 + (sub % 2) * 32 + (l % 2) * 16),
+        4,
     )
     shift = (sub >> 1) * 8
     kvs = fx.Int32(0)
     for t in range_constexpr(4):
-        kvs = kvs | (((fx.Int32(line[t]) >> shift) & 0xFF) << (8 * t))
+        kvs = kvs | (((line[t] >> shift) & 0xFF) << (8 * t))
     return kv, kvs
 
 
@@ -274,7 +270,7 @@ def _first_keys(c, pages, nt):
     return init + pages[DEPTH:]
 
 
-@traced
+@flyc.jit
 def _step(c, rows, outs, kv, kvs, st, after_mfmas):
     """Step st's logits of every row; ``after_mfmas`` once its keys are read."""
     lane = c["lane"]
@@ -303,8 +299,8 @@ def _step(c, rows, outs, kv, kvs, st, after_mfmas):
             total = None
             for mi in range_constexpr(M_TILES):
                 for e in range_constexpr(4):
-                    x = fx.Float32(accs[r][mi][e])
-                    t = x + fx.Float32(fmath.absf(x))
+                    x = accs[r][mi][e]
+                    t = x + fmath.absf(x)
                     total = (
                         _vop("v_mul_f32 $0, $1, $2", t, w[mi][e])
                         if total is None
@@ -320,7 +316,7 @@ def _step(c, rows, outs, kv, kvs, st, after_mfmas):
         bo.buffer_store(_swap_add(16, lo, hi), outs[r], key, cache_modifier=CM_DEV)
 
 
-@traced
+@flyc.jit
 def _walk(c, lead, trow, count, step_of, init, rows_n):
     """This wave's ``count`` steps ``step_of(k)`` of the piece's first
     ``rows_n`` rows, off the keys ``init`` holds in flight: DEPTH buffers,
@@ -369,7 +365,7 @@ def _walk(c, lead, trow, count, step_of, init, rows_n):
             )  # fmt: skip
 
 
-@traced
+@flyc.jit
 def stage_iscore4(c, lead, span, ch0, ch1, rows):
     """Chunks [ch0, ch1) of the ``span`` tokens from ``lead`` (a piece), each
     wave holding ``rows`` (a build constant: WALK_ROWS, or 1 for a REINDEX
@@ -408,7 +404,7 @@ def stage_iscore4(c, lead, span, ch0, ch1, rows):
         init = _stage_rows(c, lead, span, lambda: _first_keys(c, pages, nt))
         _lds_barrier()
     lds = c["rows_lds"]
-    bounds = [fx.Int32(fx.ptr_load(lds + (BOUNDS_AT + r))) for r in range(ip.WALK_ROWS)]
+    bounds = [fx.ptr_load(lds + (BOUNDS_AT + r)) for r in range(ip.WALK_ROWS)]
     # steps up to the rows' last scored chunk, from the bounds in LDS: the
     # first reads went out before them, on the chunks alone
     top = ip.score_chunks(bounds[0])
@@ -421,7 +417,7 @@ def stage_iscore4(c, lead, span, ch0, ch1, rows):
         _walk(c, lead, trow, count, step_of, init, rows)
 
 
-@traced
+@flyc.jit
 def run_scores4(c, s, bid):
     """The FP4 score stage: this CTA's task, if any. A FULL layer's comes from
     the step's host plan (``iplan``: (lead, span, ch0, ch1) a CTA, span 0 for

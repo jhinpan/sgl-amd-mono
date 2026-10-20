@@ -44,14 +44,16 @@ from typing import Optional
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
-from flydsl.expr.typing import T, as_ir_value
+from flydsl.expr.typing import T
 
 from sgl_amd_mono.common.ops import (
     CM_DEV,
     CM_SYS,
+)
+from sgl_amd_mono.common.ops import clock as clock
+from sgl_amd_mono.common.ops import (
+    global_ptr,
     load_ptr64,
     rsrc,
 )
@@ -84,20 +86,12 @@ def fault_injection(rank: int) -> Optional[tuple[int, int]]:
     return (int(site or 0), int(after or 0)) if int(r) == rank else None
 
 
-def clock():
-    """The 100 MHz reference clock (s_memrealtime)."""
-    return fx.Int64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], []))
-
-
 def stop_launch():
     """Stop the launch: a volatile store to the null page faults (address 0x0, so a
     deliberate stop is told apart from a real fault), and the runtime tears the
     queue down. Unlike ``llvm.trap`` it asks nothing of the kernel's ABI, so a
     launch that never fails pays nothing for it."""
-    null = llvm.IntToPtrOp(
-        ir.Type.parse("!llvm.ptr<1>"), as_ir_value(fx.Int64(0))
-    ).result
-    llvm.StoreOp(as_ir_value(fx.Int32(1)), null, alignment=4, volatile_=True)
+    fx.generic_store(global_ptr(0), fx.Int32(1), volatile=True)
 
 
 class Guard:

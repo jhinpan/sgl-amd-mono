@@ -4,20 +4,20 @@
 step's mailbox tag, wave and CTA reductions, and a mailbox whose plain addresses
 are device-scope scratch.
 
-The wave reductions, ``readlane``, ``unlikely`` and ``fp8x8_bf16_pk`` are adapted
+The wave reductions, ``readlane`` and ``unlikely`` are adapted
 from ROCm/ATOM (https://github.com/ROCm/ATOM) at 454d0e3023 (MIT License,
 Copyright (C) 2026, Advanced Micro Devices, Inc.)."""
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu
 from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
-from sgl_amd_mono.common.ops import butterfly, rsrc, traced, uniform
+from sgl_amd_mono.common.ops import butterfly, rsrc, uniform, wave_max
 from sgl_amd_mono.common.plan import WAVES
 from sgl_amd_mono.common.sync import POLL_MAX, Addr, Mailbox, Space
 from sgl_amd_mono.minimax_m3.gfx950.config import LAYER_SLOTS
@@ -85,7 +85,7 @@ def unlikely(cond):
     never runs (the long-context selection: S = 16, 3k context +1.4 us)."""
     return fx.Boolean(
         llvm.call_intrinsic(
-            ir.IntegerType.get_signless(1),
+            fx.Boolean.ir_type,
             "llvm.expect.i1",
             [as_ir_value(cond), as_ir_value(fx.Boolean(False))],
             [],
@@ -98,11 +98,7 @@ def wave_sum(v):
     return butterfly(v, (32, 16, 8, 4, 2, 1))
 
 
-def wave_max(v):
-    return butterfly(v, (32, 16, 8, 4, 2, 1), fx.max)
-
-
-@traced
+@flyc.jit
 def block_max(v, lane, wave, red):
     """Max of v over the CTA's WAVES waves; ``red`` needs WAVES words."""
     wv = wave_max(v)
@@ -115,16 +111,3 @@ def block_max(v, lane, wave, red):
         t = fx.max(t, fx.ptr_load(red + w))
     gpu.barrier()
     return t
-
-
-def fp8x8_bf16_pk(words):
-    """Eight fp8 of two dwords -> bf16 MFMA operand (exact) by
-    v_cvt_scalef32_pk_bf16_fp8 (scale 1), two values an instruction."""
-    out = []
-    for w in words:
-        for hi in (False, True):
-            p = rocdl.cvt_scalef32_pk_bf16_fp8(
-                T.bf16x2, as_ir_value(fx.Int32(w)), as_ir_value(fx.Float32(1.0)), hi
-            )
-            out.append(fx.Vector(p).bitcast(fx.Int32)[0])
-    return fx.Vector.from_elements(out, fx.Int32).bitcast(fx.BFloat16)

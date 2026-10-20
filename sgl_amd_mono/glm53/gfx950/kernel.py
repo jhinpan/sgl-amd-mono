@@ -56,6 +56,34 @@ from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.epoch import spin_until
+from sgl_amd_mono.common.ops import (
+    bpermute_i32,
+)
+from sgl_amd_mono.common.ops import clock as mem_realtime
+from sgl_amd_mono.common.ops import (
+    div_rn,
+    f8_word,
+    fp8_pack4,
+)
+from sgl_amd_mono.common.ops import fp8_roundtrip as _fp8_roundtrip
+from sgl_amd_mono.common.ops import fp8_to_bf16x8 as _fp8_to_bf16x8
+from sgl_amd_mono.common.ops import hw_exp as _exp
+from sgl_amd_mono.common.ops import hw_rcp as _rcp
+from sgl_amd_mono.common.ops import hw_rsq as _rsq
+from sgl_amd_mono.common.ops import mxfp4_to_bf16x8 as _mxfp4_to_bf16x8
+from sgl_amd_mono.common.ops import (
+    read_lane_i32,
+)
+from sgl_amd_mono.common.ops import rsrc as _rsrc
+from sgl_amd_mono.common.ops import uniform as _uniform
+from sgl_amd_mono.common.ops import uniform_f32 as _uniform_f32
+from sgl_amd_mono.common.ops import (
+    wave_max,
+    wave_umax,
+    write_lane_i32,
+)
+from sgl_amd_mono.common.ops import xred as _xred
+from sgl_amd_mono.common.ops import xshfl as _xshfl
 from sgl_amd_mono.common.plan import kernel_sources, key_tuple
 
 from .config import (
@@ -118,35 +146,6 @@ from .layout import (
     ug_split,
     ug_task_rounds,
 )
-from .ops import (
-    bpermute_i32,
-    div_rn,
-)
-from .ops import exp as _exp
-from .ops import (
-    f8_word,
-    fp8_pack4,
-)
-from .ops import fp8_roundtrip as _fp8_roundtrip
-from .ops import fp8_to_bf16x8 as _fp8_to_bf16x8
-from .ops import (
-    mem_realtime,
-)
-from .ops import mxfp4_to_bf16x8 as _mxfp4_to_bf16x8
-from .ops import rcp as _rcp
-from .ops import (
-    read_lane_i32,
-)
-from .ops import rsq as _rsq
-from .ops import rsrc as _rsrc
-from .ops import uniform as _uniform
-from .ops import uniform_f32 as _uniform_f32
-from .ops import (
-    wave_umax_dpp,
-    write_lane_i32,
-)
-from .ops import xred as _xred
-from .ops import xshfl as _xshfl
 from .tiles import (
     CM_DEV,
     CM_SYS,
@@ -745,11 +744,6 @@ def build_glm5_monokernel(
                 v = _xred(v, 32 >> sh, lambda a, b: a + b)
             return v
 
-        def wave_max(v):
-            for sh in range_constexpr(6):
-                v = _xred(v, 32 >> sh, fx.max)
-            return v
-
         def block_sums(vs):
             """Block-wide sums of several per-thread values with one LDS exchange."""
             ws = [wave_sum(v) for v in vs]
@@ -991,11 +985,8 @@ def build_glm5_monokernel(
         def lds_mxfp8(chunk_word):
             """One scaled-MFMA B operand from a row-major 128-value MXFP8 tile."""
             words = [
-                fx.Vector(
-                    fx.ptr_load(
-                        xs + chunk_word + 16 * half + 4 * (lane // 16),
-                        result_type=v4f,
-                    )
+                fx.ptr_load(
+                    xs + chunk_word + 16 * half + 4 * (lane // 16), result_type=v4f
                 ).bitcast(fx.Int32)
                 for half in range(2)
             ]
@@ -1067,8 +1058,8 @@ def build_glm5_monokernel(
                         a = _mxfp4_to_bf16x8(raw[sp], scales[sp])
                         if const_expr(fmt == "mxfp4"):
                             wh, ws = sp // 2, sp % 2
-                            bv = fx.Vector(
-                                fx.ptr_load(xs + (bw + wh * 16), result_type=v4f)
+                            bv = fx.ptr_load(
+                                xs + (bw + wh * 16), result_type=v4f
                             ).bitcast(fx.Int32)
                             b = _fp8_to_bf16x8(bv[ws * 2], bv[ws * 2 + 1])
                         else:
@@ -1083,9 +1074,9 @@ def build_glm5_monokernel(
                         [wv[h][e] for h in range(2) for e in range(4)], fx.Int32
                     )
                     bv = [
-                        fx.Vector(
-                            fx.ptr_load(xs + (bw + h * 16), result_type=v4f)
-                        ).bitcast(fx.Int32)
+                        fx.ptr_load(xs + (bw + h * 16), result_type=v4f).bitcast(
+                            fx.Int32
+                        )
                         for h in range(2)
                     ]
                     b = fx.Vector.from_elements(
@@ -1122,8 +1113,8 @@ def build_glm5_monokernel(
                     halves64 = 2 if fmt == "ptpc" else 1
                     for half64 in range_constexpr(halves64):
                         a = wv[half64].bitcast(fx.Int64)
-                        b = fx.Vector(
-                            fx.ptr_load(xs + (bw + half64 * 16), result_type=v4f)
+                        b = fx.ptr_load(
+                            xs + (bw + half64 * 16), result_type=v4f
                         ).bitcast(fx.Int64)
                         for half32 in range_constexpr(2):
                             c = fx.Vector(
@@ -1576,8 +1567,8 @@ def build_glm5_monokernel(
             ids = ids + [fx.Int32(N_EXPERTS)]
             mv = fx.Int32(0)  # lane k: the expert ID of pick k
             for k in range_constexpr(TOP_K):
-                m = wave_umax_dpp(ks[0])
-                winner = wave_umax_dpp((ks[0] == m).select(255 - ids[0], fx.Int32(0)))
+                m = wave_umax(ks[0])
+                winner = wave_umax((ks[0] == m).select(255 - ids[0], fx.Int32(0)))
                 expert = 255 - winner
                 hit = (ks[0] == m) & (ids[0] == expert)
                 ks = [hit.select(ks[i + 1], ks[i]) for i in range(4)] + [ks[4]]

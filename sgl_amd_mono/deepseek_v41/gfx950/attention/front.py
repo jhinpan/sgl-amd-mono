@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Run wqkv_a, the q / kv norms, RoPE, the V4 KV store and wq_b (K1's attention front)."""
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 import msgspec
 from aiter.ops.flydsl.kernels import buffer_ops as bo
@@ -18,7 +19,6 @@ from sgl_amd_mono.common.ops import (
     hw_rsq,
     row_sum,
     rsrc,
-    traced,
     xshfl,
 )
 from sgl_amd_mono.common.plan import first_task
@@ -93,7 +93,7 @@ class FrontBuild(msgspec.Struct, frozen=True):
     swa_width: int = WINDOW
 
 
-@traced
+@flyc.jit
 def publish(c, region, i):
     """This CTA's stores visible device-wide, then the flag pair (region, i)."""
     rocdl.s_waitcnt(vmcnt=0)
@@ -102,7 +102,7 @@ def publish(c, region, i):
         c["mb"].put(region, i, fx.Int32(1))
 
 
-@traced
+@flyc.jit
 def await_flags(c, region, n, index):
     """Thread u < n polls flag ``index(u)``; then the CTA proceeds."""
     tid = c["tid"]
@@ -114,7 +114,7 @@ def await_flags(c, region, n, index):
 # ---------------------------------------------------------------- kt
 
 
-@traced
+@flyc.jit
 def stage_kt(c, t):
     """Token t's keys for K2: ``KT[t][k] = slot | 1 << 31`` for its top-k compressed
     rows (k < ntopk), its window slots for k in [ntopk, kv_len), -1 past them or
@@ -153,7 +153,7 @@ def stage_wqkv(c, ops, slots, n, halves):
     return accs
 
 
-@traced
+@flyc.jit
 def wqkv_publish(c, task, accs, slots, order, t0, n, live):
     """Sum wqkv rows 16 task .. for tokens t0 .. t0 + n in SGLang's order into fp32 QKVP."""
     tid, red = c["tid"], c["red"]
@@ -171,7 +171,7 @@ def wqkv_publish(c, task, accs, slots, order, t0, n, live):
 # ---------------------------------------------------------------- q / kv norms
 
 
-@traced
+@flyc.jit
 def stage_qkv(c, t):
     """Token t: q_norm to QX8, and kv_norm + RoPE to the fp8_ds_mla record at its slot."""
     tid, lane, wave, red = c["tid"], c["lane"], c["wave"], c["red"]
@@ -322,7 +322,7 @@ def wqb_pos(c, t0, n):
     return ld_i32(c["args"]["pos"], 2 * (t0 + tl))
 
 
-@traced
+@flyc.jit
 def stage_wqb(c, task0, bops, t0, n, rope):
     """Run the CTA's wq_b tasks: GEMV, bf16, GPT-J RoPE of dims 448.., store q."""
     tid, red, d = c["tid"], c["red"], c["d"]
@@ -402,7 +402,7 @@ def front_context(key, lds, args: dict, scratch, tag, layout=None) -> dict:
     return c
 
 
-@traced
+@flyc.jit
 def run_front(c, key, bid, x8_given=False, before_wqkv=None, after_wqkv=None):
     """Run the front's stages on this CTA; the seam publishes X8 before them."""
     s = key.tokens

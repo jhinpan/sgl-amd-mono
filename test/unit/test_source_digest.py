@@ -63,7 +63,7 @@ def _keys_the_build(builder: ast.FunctionDef) -> bool:
 
 
 def _launchers():
-    """Each ``@flyc.jit`` launcher in the package, with whether it closes over a
+    """Each ``@flyc.jit`` that launches a kernel, with whether it closes over a
     ``keyed`` that holds its module's import-time digest and every build parameter
     (itself or through a kernel it calls)."""
     for path in sorted(PACKAGE.rglob("*.py")):
@@ -71,6 +71,15 @@ def _launchers():
         parent = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
         for fn in ast.walk(tree):
             if not (isinstance(fn, ast.FunctionDef) and _flyc(fn, "jit")):
+                continue
+            # Device helpers also use @flyc.jit; the enclosing launcher owns
+            # their transitive source digest.
+            if not any(
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "launch"
+                for n in ast.walk(fn)
+            ):
                 continue
             builder = parent.get(fn)
             while builder is not None and not isinstance(builder, ast.FunctionDef):
