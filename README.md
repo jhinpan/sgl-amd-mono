@@ -16,7 +16,7 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 | --- | --- | --- | --- |
 | DeepSeek-V4.1-Flash | MI350X, MI355X (gfx950) | 2, 4 | All 40 layers in decode and DSpark verify steps of up to 48 rows, and the DSpark draft stages |
 | GLM-5.3-Flash | MI355X (gfx950) | 2, 4, 8 | 41 of the 42 MoE layers, all but the last (one launch each), in decode steps of up to 8 rows (4 at TP2) |
-| GLM-5.3 | MI355X (gfx950) | 4, 8 | All 75 MoE layers (one launch each), in decode steps of up to 8 rows (4 at TP4) |
+| GLM-5.3 | MI355X (gfx950) | 4, 8 | All 75 MoE layers (one launch each), in decode and MTP verify steps of up to 8 rows (4 at TP4) |
 | MiniMax-M3 (MXFP4) | MI350X, MI355X (gfx950) | 4 | The 57 sparse MoE layers in decode and EAGLE3 verify steps of up to 16 rows |
 
 ### Design
@@ -59,6 +59,22 @@ SGLANG_USE_AITER=1 AITER_BF16_FP8_MOE_BOUND=0 python -m sglang.launch_server \
 On gfx950 the decode graph capture fails in AITER's MoE without
 `AITER_BF16_FP8_MOE_BOUND=0`. The flags are those of the serving tests
 (`test/e2e/deepseek_v41_server.py`).
+
+GLM-5.3, with MTP (its NextN layer drafts one chain; a verify step of 4 rows a
+request runs the kernels at batch sizes 1 and 2 at TP8):
+
+```bash
+SGLANG_USE_AITER=1 python -m sglang.launch_server \
+  --model-path zai-org/GLM-5.3 \
+  --tp 8 \
+  --dsa-prefill-backend tilelang \
+  --dsa-decode-backend tilelang \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --monokernel-backend amd
+```
 
 MiniMax-M3, with an EAGLE3 draft:
 

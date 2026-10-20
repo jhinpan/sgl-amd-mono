@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """SGLANG_AMD_MONO_CHECK=1 (eager only): each covered layer also runs SGLang's
 layer on its input, on the caches as they were, and checks the kernel's outputs
-against it: the hidden stream it writes, and the cache rows the layer writes, each
-against its ``spec.NUMERICS`` bound. Every check is logged; a miss is logged as a
-violation."""
+against it: the hidden stream it writes, the cache rows the layer writes, and on
+an indexer layer the top-k it selects, each against its ``spec.NUMERICS`` bound.
+Every check is logged; a miss is logged as a violation."""
 
 from __future__ import annotations
 
@@ -64,6 +64,24 @@ def _outputs(name: str, a: torch.Tensor, b: torch.Tensor) -> dict[str, dict]:
     # a key whose amax sits at a power of two may take the other scale and values
     (ka, sa), (kb, sb) = _index_keys(a), _index_keys(b)
     return {"index": _metrics(ka, kb), "index_scale": _metrics(sa, sb)}
+
+
+def _topk_outputs(ref_topk: torch.Tensor, step, slots: torch.Tensor, S: int) -> dict:
+    """Per row, SGLang's selected KV slots against the kernel's (``step.topk`` at
+    the row's ``indptr``): the largest share of SGLang's a row misses, and the most
+    of this step's own slots (a verify row's earlier drafts and itself) one misses."""
+    bounds = step.indptr[: S + 1].tolist()
+    picked = step.topk.tolist()
+    own = set(slots[slots > 0].tolist())
+    rel, own_missed = 0.0, 0
+    for s, row in enumerate(ref_topk[:S].tolist()):
+        want = {k for k in row if k >= 0}
+        if not want:
+            continue
+        missed = want - set(picked[bounds[s] : bounds[s + 1]])
+        rel = max(rel, len(missed) / len(want))
+        own_missed = max(own_missed, len(missed & own))
+    return {"topk": {"rel": rel}, "topk_own": {"max_abs": float(own_missed)}}
 
 
 def _regions(L, forward_batch, S: int) -> dict:
@@ -150,7 +168,7 @@ def reference(L, positions, h_in, forward_batch, S: int, prev_topk) -> dict:
 
 
 def compare(
-    L, ref: dict, streams: torch.Tensor, positions, forward_batch, S: int
+    L, ref: dict, streams: torch.Tensor, positions, forward_batch, S: int, step
 ) -> None:
     from sglang.srt.runtime_context import get_parallel
 
@@ -161,6 +179,10 @@ def compare(
     outputs = _outputs("streams", streams, ref["streams"])
     for name, (t, idx) in _regions(L, forward_batch, S).items():
         outputs.update(_outputs(name, t[idx], ref[name]))
+    # SGLang's layer returns no top-k when no later layer reuses it
+    if L.w.index is not None and ref["topk"] is not None:
+        slots = forward_batch.out_cache_loc[:S]
+        outputs.update(_topk_outputs(ref["topk"], step, slots, S))
     values = {
         f"layer.{out}.{metric}": v
         for out, ms in outputs.items()

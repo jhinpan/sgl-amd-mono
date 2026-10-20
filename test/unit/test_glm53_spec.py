@@ -1,9 +1,11 @@
 """The GLM-5.3 gfx950 monokernel spec on CPU (RFC #43949): the layers its forward
-covers on the GLM-5.3 layer structure, its row routing and TP4 row cap, its registry
-entry, and its config and model refusal reasons. SGLang checks its declared
-requirements, the same way for every spec."""
+covers on the GLM-5.3 layer structure, its row routing and TP4 row cap, the keys
+each row of a decode or MTP verify step attends, its registry entry, and its config
+and model refusal reasons. SGLang checks its declared requirements, the same way
+for every spec."""
 
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -64,19 +66,93 @@ def test_a_step_runs_at_the_next_width_and_tp4_takes_four_rows():
     runtimes = {(w, k): None for w in (2, 4) for k in ("index", "shared")}
     layers = {i: SimpleNamespace(i=i) for i in range(3, 78)}
     lm = _Lm()
-    built = glm53._Built(lm, layers, runtimes, None, None, tp=4, device="cpu")
+    built = _built(lm, layers, runtimes, tp=4)
     key = registry.ShapeKey(forward_mode="decode", batch_size=5, tokens_per_request=1)
     out = built.forward(registry.Plan(key=key), "ids", "positions", "batch")
     assert out == "the model's forward"
     assert lm.ran == [("ids", "positions", "batch", None, None)]
-    assert (
-        glm53._Built(lm, layers, runtimes, None, None, tp=8, device="cpu").max_rows == 8
+    assert _built(lm, layers, runtimes, tp=8).max_rows == 8
+
+
+def _built(lm, layers, runtimes, tp=8, context_len=202752):
+    return glm53._Built(
+        lm, layers, runtimes, None, None, tp, "cpu", context_len=context_len
     )
 
 
+def _step_rows(positions, slots, seq_lens, context_len=202752):
+    """``_Built._step`` on CPU: each row's position and its keys (indptr)."""
+    W = 4
+    runtimes = {(W, k): None for k in ("index", "shared")}
+    built = _built(_Lm(), {3: None}, runtimes, context_len=context_len)
+    batch = SimpleNamespace(
+        out_cache_loc=torch.tensor(slots), seq_lens=torch.tensor(seq_lens)
+    )
+    backend = SimpleNamespace(
+        forward_metadata=SimpleNamespace(real_page_table=torch.zeros(W, 1))
+    )
+    key = registry.ShapeKey(
+        forward_mode="target_verify", batch_size=1, tokens_per_request=W
+    )
+    with mock.patch(
+        "sglang.srt.model_executor.forward_context.get_attn_backend",
+        return_value=backend,
+    ):
+        step = built._step(
+            registry.Plan(key=key), torch.tensor(positions), batch, len(slots), W
+        )
+    return step.positions.tolist(), step.indptr.tolist()
+
+
+def test_a_verify_row_sees_its_prefix_and_the_drafts_up_to_it():
+    # one request of prefix 10 verifies 4 drafts at positions 10..13: SGLang's
+    # seq_lens holds the prefix, and row j attends 10 + j + 1 keys
+    _, indptr = _step_rows([10, 11, 12, 13], [100, 101, 102, 103], [10])
+    assert indptr == [0, 11, 23, 36, 50]
+    # a decode step: one row a request, seq_lens = position + 1; a pad row attends none
+    _, indptr = _step_rows([5, 7, 0, 0], [40, 41, 0, 0], [6, 8, 1, 1])
+    assert indptr == [0, 6, 14, 14, 14]
+    # past 2048 keys a row attends the indexer's top-2048
+    _, indptr = _step_rows([4000, 4001, 4002, 4003], [7, 8, 9, 10], [4000])
+    assert indptr == [0, 2048, 4096, 6144, 8192]
+
+
+def test_verify_lookahead_past_the_context_stays_in_the_tables():
+    # a 12-token context: drafts at 12 and 13 are lookahead the scheduler discards;
+    # they keep positions the rotary table and the indexer's score rows hold
+    positions, indptr = _step_rows(
+        [10, 11, 12, 13], [100, 101, 102, 103], [10], context_len=12
+    )
+    assert positions == [10, 11, 11, 11]
+    assert indptr == [0, 11, 23, 35, 47]
+
+
+# the server arguments the spec reads before load: no speculative decoding
+CFG = SimpleNamespace(page_size=None, speculative_algorithm=None)
+# MTP: SGLang's GLM-5.3 default draft chain (NEXTN resolves to EAGLE)
+MTP = SimpleNamespace(
+    page_size=None,
+    speculative_algorithm="EAGLE",
+    speculative_eagle_topk=1,
+    speculative_num_steps=3,
+    speculative_num_draft_tokens=4,
+)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [{"speculative_eagle_topk": 2}, {"speculative_num_draft_tokens": 3}],
+    ids=["tree draft", "draft tokens"],
+)
+def test_mtp_runs_one_draft_chain(changes):
+    assert glm53._config_disable_reasons(MTP, GLM53) == []
+    cfg = SimpleNamespace(**{**vars(MTP), **changes})
+    reasons = glm53._config_disable_reasons(cfg, GLM53)
+    assert len(reasons) == 1 and "one draft chain" in reasons[0]
+
+
 def test_config_reasons_name_each_mismatch():
-    cfg = SimpleNamespace(page_size=None)
-    assert glm53._config_disable_reasons(cfg, GLM53) == []
+    assert glm53._config_disable_reasons(CFG, GLM53) == []
     other = SimpleNamespace(
         **{
             **vars(GLM53),
@@ -86,7 +162,8 @@ def test_config_reasons_name_each_mismatch():
             "rope_parameters": {"rope_type": "yarn", "factor": 4.0},
         }
     )
-    reasons = glm53._config_disable_reasons(SimpleNamespace(page_size=1), other)
+    cfg = SimpleNamespace(**{**vars(CFG), "page_size": 1})
+    reasons = glm53._config_disable_reasons(cfg, other)
     text = " ".join(reasons)
     assert "index_topk_freq" in text
     assert "MoE" in text
