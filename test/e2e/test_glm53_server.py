@@ -35,8 +35,8 @@ LAUNCH_TIMEOUT = 3600
 GSM8K_BOUND = 0.90
 # Decode against prefill, one batch of prompts at a time (every decode step covered)
 KL_BOUND = 0.06
-# MTP (3 draft tokens): the normal path's GSM8K accept length; the bound is for
-# gross failures
+# MTP (3 draft tokens) accepts about 3.1 tokens a step on this GSM8K run (measured at
+# TP4); the bound is for gross failures
 MTP_ACCEPT_BOUND = 2.5
 
 
