@@ -245,10 +245,13 @@ class TestMonokernelFault(CustomTestCase):
                 out.seek(0)
                 log = err.read() + out.read()
                 # a launch never runs on after a failed wait: it stops with a store
-                # to the null page, so the only faults are at address 0x0
-                faults = re.findall(r"faulting addr: (0x[0-9a-fA-F]+)", log)
+                # to the null page, so the only faults are at address 0x0 (ROCm
+                # prints "faulting addr: 0x0" or "on address (nil)")
+                faults = re.findall(
+                    r"(?:faulting addr: |on address )(0x[0-9a-fA-F]+|\(nil\))", log
+                )
                 self.assertTrue(faults, log[-2000:])
-                self.assertEqual(set(faults) - {"0x0"}, set(), faults)
+                self.assertEqual(set(faults) - {"0x0", "(nil)"}, set(), faults)
             finally:
                 terminate_and_kill_process_tree(process)
 
