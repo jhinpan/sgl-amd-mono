@@ -2666,66 +2666,88 @@ def build_glm5_monokernel(
             # read from its row's index_k_new pair; the cache store is not yet visible.
             new_active = [row_writes_cache(n) for n in range(S)]
             new_slots = [row_slot(n) for n in range(S)]
-            for s in range_constexpr(S):
-                bound = index_bound(s)
-                req = index_request(s)
-                pos = bound - 1
-                n_tiles = (bound + INDEX_KEYS_PER_TASK - 1) // INDEX_KEYS_PER_TASK
-                first_cta = (101 + s * (G // S)) % G
-                first_tile = (bid + (G - first_cta)) & (G - 1)
-                # The row's rotated query and head weights stay in LDS for all
-                # of this CTA's tiles.
-                if first_tile < n_tiles:
-                    get(mb("index_ready"), s)
-                    if tid < INDEX_HEADS:
-                        lds_st(keys, tid, get(mb("index_w"), s * INDEX_HEADS + tid))
-                    for b in range_constexpr((INDEX_Q_ROWS // 2) // THREADS):
-                        q_pair = tid + b * THREADS
-                        q_elem = q_pair * 2
-                        kq = q_elem % INDEX_DIM
-                        q0, q1 = get_bf2_many(
-                            [(mb("index_q"), s * INDEX_Q_ROWS + q_elem)]
-                        )[0]
-                        if kq < PE_DIM:
-                            c = ld_bf16(_rsrc(rope_cos), pos * (PE_DIM // 2) + kq // 2)
-                            sn = ld_bf16(_rsrc(rope_sin), pos * (PE_DIM // 2) + kq // 2)
-                            q0, q1 = q0 * c - q1 * sn, q0 * sn + q1 * c
-                        q0, q1 = fwht128(q0, q1)
-                        lds_st(xs, q_pair, bf16_pair(q0, q1))
-                    gpu.barrier()
-                for tile in range(first_tile, n_tiles, G):
-                    tile = fx.Int32(tile)
-                    stamp("index_score", s * N_PAGED_SPLIT + tile, 0)
-                    key_group = wave // 2
-                    head_group = wave % 2
-                    key_pos = tile * INDEX_KEYS_PER_TASK + key_group * 16 + lane % 16
-                    safe_key = fx.min(key_pos, bound - 1)
-                    head = head_group * 16 + lane % 16
-                    block = index_block(req, safe_key)
-                    off = safe_key % index_block_size
+
+            # Each wave scores groups of 16 keys over all 32 heads (two MFMA chains
+            # off one read of the keys), every 8th group of its CTA's tiles, with
+            # SCORE_DEPTH groups' reads in flight and their blocks a trip ahead.
+            SCORE_DEPTH = 2
+            SCORE_STRIDE = 2 * G * INDEX_KEYS_PER_TASK
+            SCORE_BUF = 6  # a group in flight: 4 word pairs, its scale and block
+            assert S <= 16  # a row's last S keys reach one group of a wave at most
+
+            def lds_barrier():
+                """A barrier for an LDS hand-off only: gpu.barrier would also wait on
+                the key reads in flight."""
+                fx.memory_fence(
+                    ordering=fx.AtomicOrdering.Release, syncscope="workgroup"
+                )
+                rocdl.s_barrier()
+                fx.memory_fence(
+                    ordering=fx.AtomicOrdering.Acquire, syncscope="workgroup"
+                )
+
+            def score_block(req, pos, key0, live):
+                """This lane's cache block in the group from key0 (0 when not live)."""
+                block = fx.Int32(0)
+                if live:
+                    block = index_block(req, fx.min(key0 + lane % 16, pos))
+                return block
+
+            def score_fetch(block, pos, key0, live, kofs):
+                """A group's buffer: this lane's cache words for its 4 MFMA steps
+                (``kofs``: their offsets past the token's first word), its key's
+                scale and block (zeros when not live)."""
+                block = fx.Int32(block)
+                off = fx.min(key0 + lane % 16, pos) % index_block_size
+                w0 = fx.Vector.filled(2, 0, fx.Int32)
+                w1 = w0
+                w2 = w0
+                w3 = w0
+                scale = fx.Float32(0.0)
+                if live:
+                    word = index_value_word(block, off, 0)
+                    w0, w1, w2, w3 = [
+                        fx.Vector(
+                            bo.buffer_load(
+                                r_index_cache, word + d, vec_width=2, dtype=T.i32
+                            )
+                        )
+                        for d in kofs
+                    ]
+                    scale = ld_f32(r_index_cache, index_scale_word(block, off))
+                return [w0, w1, w2, w3, scale, block]
+
+            def score_group(s, bound, pos, key0, buf, qf, wf, wave_u, may_new):
+                """The group's scores: lane l < 16 publishes key key0 + l's.
+                ``may_new``: the group holds one of the row's last S keys, the
+                only ones this launch writes."""
+                key_pos = key0 + lane % 16
+                tile = key0 // INDEX_KEYS_PER_TASK
+                group = (key0 % INDEX_KEYS_PER_TASK) // 16
+                last = fx.min(
+                    fx.Int32(INDEX_KEYS_PER_TASK // 16 - 1),
+                    (pos - tile * INDEX_KEYS_PER_TASK) // 16,
+                )
+                if group == 0:
+                    stamp("index_score", s * N_PAGED_SPLIT + tile, 0, lead=wave_u * 64)
+                k_scale = fx.Float32(buf[4])
+                if const_expr(may_new):
+                    block = fx.Int32(buf[5])
+                    off = fx.min(key_pos, pos) % index_block_size
                     key_slot = block * index_block_size + off
                     new_row = fx.Int32(-1)
                     for n in range_constexpr(S):
                         hit = new_active[n] & (key_slot == new_slots[n])
                         new_row = hit.select(fx.Int32(n), new_row)
                     is_new = new_row >= 0
-                    k_scale = is_new.select(
-                        fx.Float32(1.0),
-                        ld_f32(r_index_cache, index_scale_word(block, off)),
-                    )
-                    score_frag = fx.Vector.filled(4, 0.0, fx.Float32)
-                    for k32 in range_constexpr(INDEX_DIM // 32):
-                        k = k32 * 32 + (lane // 16) * 8
-                        qv = load_index_q8(head, k)
-                        kw = fx.Vector(
-                            bo.buffer_load(
-                                r_index_cache,
-                                index_value_word(block, off, k),
-                                vec_width=2,
-                                dtype=T.i32,
-                            )
-                        )
-                        kv = _fp8_to_bf16x8(kw[0], kw[1])
+                    k_scale = is_new.select(fx.Float32(1.0), k_scale)
+                acc0 = fx.Vector.filled(4, 0.0, fx.Float32)
+                acc1 = acc0
+                for k32 in range_constexpr(INDEX_DIM // 32):
+                    k = k32 * 32 + (lane // 16) * 8
+                    kw = fx.Vector(buf[k32])
+                    kv = _fp8_to_bf16x8(kw[0], kw[1])
+                    if const_expr(may_new):
                         if is_new:
                             kv_pairs = get_bf2_many(
                                 [
@@ -2742,31 +2764,190 @@ def build_glm5_monokernel(
                             kv = fx.Vector.from_elements(kv_values, fx.Float32).to(
                                 fx.BFloat16
                             )
-                        score_frag = fx.Vector(
-                            rocdl.mfma_f32_16x16x32_bf16(
-                                T.vec(4, T.f32), [qv, kv, score_frag]
-                            )
+                    acc0 = fx.Vector(
+                        rocdl.mfma_f32_16x16x32_bf16(
+                            T.vec(4, T.f32), [qf[0][k32], kv, acc0]
                         )
+                    )
+                    acc1 = fx.Vector(
+                        rocdl.mfma_f32_16x16x32_bf16(
+                            T.vec(4, T.f32), [qf[1][k32], kv, acc1]
+                        )
+                    )
+                halves = []
+                for hg in range_constexpr(2):
+                    acc = acc1 if hg else acc0
                     partial = fx.Float32(0.0)
                     for e in range_constexpr(4):
-                        index_head = head_group * 16 + (lane // 16) * 4 + e
-                        weight = lds_ld(keys, index_head).bitcast(fx.Float32)
-                        partial = (
-                            partial + fx.max(score_frag[e], fx.Float32(0.0)) * weight
-                        )
+                        partial = partial + fx.max(acc[e], fx.Float32(0.0)) * wf[hg][e]
                     partial = partial * k_scale
                     partial = _xred(partial, 16, lambda a, b: a + b)
                     partial = _xred(partial, 32, lambda a, b: a + b)
-                    if lane < 16:
-                        lds_st(red, wave * 16 + lane, partial)
-                    gpu.barrier()
-                    if (wave % 2 == 0) & (lane < 16) & (key_pos < bound):
-                        score = lds_ld(red, wave * 16 + lane) + lds_ld(
-                            red, (wave + 1) * 16 + lane
+                    halves.append(partial)
+                if (lane < 16) & (key_pos < bound):
+                    put(
+                        mb("index_scores"),
+                        s * index_max_seq + key_pos,
+                        halves[0] + halves[1],
+                    )
+                if group == last:
+                    stamp("index_score", s * N_PAGED_SPLIT + tile, 4, lead=wave_u * 64)
+
+            def score_walk(s, row, init, qf, wf, kofs):
+                """This wave's ``count`` groups from key ``wave_key0``, SCORE_STRIDE
+                apart, off ``init``: the first SCORE_DEPTH groups' buffers, then the
+                next SCORE_DEPTH groups' blocks. A buffer is refilled right after its
+                group, with the group SCORE_DEPTH on. The first ``n_plain`` groups
+                hold none of the keys this launch writes; the rest (one at most) is
+                scored after them."""
+                req, bound, pos, wave_u, wave_key0, count, n_plain = row
+
+                def key0_of(k):
+                    return wave_key0 + k * SCORE_STRIDE
+
+                trips = n_plain // SCORE_DEPTH
+                for j, state in range(0, trips, 1, init=init):
+                    k_trip = fx.Int32(j) * SCORE_DEPTH
+                    refills = []
+                    lookups = []
+                    for i in range_constexpr(SCORE_DEPTH):
+                        k_i = k_trip + i
+                        score_group(
+                            s,
+                            bound,
+                            pos,
+                            key0_of(k_i),
+                            state[i * SCORE_BUF : (i + 1) * SCORE_BUF],
+                            qf,
+                            wf,
+                            wave_u,
+                            False,
                         )
-                        put(mb("index_scores"), s * index_max_seq + key_pos, score)
-                    gpu.barrier()
-                    stamp("index_score", s * N_PAGED_SPLIT + tile, 4)
+                        k_fill = k_i + SCORE_DEPTH
+                        refills += score_fetch(
+                            state[SCORE_DEPTH * SCORE_BUF + i],
+                            pos,
+                            key0_of(k_fill),
+                            k_fill < count,
+                            kofs,
+                        )
+                        k_look = k_i + 2 * SCORE_DEPTH
+                        lookups.append(
+                            score_block(req, pos, key0_of(k_look), k_look < count)
+                        )
+                    carried = yield refills + lookups
+                for i in range_constexpr(SCORE_DEPTH):
+                    k_tail = trips * SCORE_DEPTH + i
+                    buf = carried[i * SCORE_BUF : (i + 1) * SCORE_BUF]
+                    if k_tail < n_plain:
+                        score_group(
+                            s, bound, pos, key0_of(k_tail), buf, qf, wf, wave_u, False
+                        )
+                    else:
+                        if k_tail < count:
+                            score_group(
+                                s,
+                                bound,
+                                pos,
+                                key0_of(k_tail),
+                                buf,
+                                qf,
+                                wf,
+                                wave_u,
+                                True,
+                            )
+
+            def score_row(s):
+                # wave-uniform (scalar) values: the walk's branches and trip counts
+                bound = _uniform(index_bound(s))
+                req = _uniform(index_request(s))
+                pos = bound - 1
+                n_tiles = (bound + INDEX_KEYS_PER_TASK - 1) // INDEX_KEYS_PER_TASK
+                first_cta = (101 + s * (G // S)) % G
+                first_tile = (bid + (G - first_cta)) & (G - 1)
+                if first_tile < n_tiles:
+                    wave_u = _uniform(wave)
+                    wave_key0 = (
+                        first_tile + (wave_u // 4) * G
+                    ) * INDEX_KEYS_PER_TASK + (wave_u % 4) * 16
+                    count = (bound > wave_key0).select(
+                        (bound - wave_key0 + SCORE_STRIDE - 1) // SCORE_STRIDE,
+                        fx.Int32(0),
+                    )
+                    plain_end = pos - (S - 1) - 15 - wave_key0
+                    n_plain = fx.min(
+                        (plain_end > 0).select(
+                            (plain_end + SCORE_STRIDE - 1) // SCORE_STRIDE, fx.Int32(0)
+                        ),
+                        count,
+                    )
+                    row = (req, bound, pos, wave_u, wave_key0, count, n_plain)
+                    # a token's word of dims d .. d + 3 is its first word plus that of
+                    # dims d in token 0 of block 0
+                    kofs = [
+                        index_value_word(fx.Int32(0), 0, k32 * 32 + (lane // 16) * 8)
+                        for k32 in range(INDEX_DIM // 32)
+                    ]
+                    # the first blocks' lookups overlap the query's staging
+                    blocks = [
+                        score_block(
+                            req, pos, wave_key0 + k * SCORE_STRIDE, fx.Int32(k) < count
+                        )
+                        for k in range(2 * SCORE_DEPTH)
+                    ]
+                    get(mb("index_ready"), s)
+                    if tid < INDEX_HEADS:
+                        lds_st(keys, tid, get(mb("index_w"), s * INDEX_HEADS + tid))
+                    for b in range_constexpr((INDEX_Q_ROWS // 2) // THREADS):
+                        q_pair = tid + b * THREADS
+                        q_elem = q_pair * 2
+                        kq = q_elem % INDEX_DIM
+                        q0, q1 = get_bf2_many(
+                            [(mb("index_q"), s * INDEX_Q_ROWS + q_elem)]
+                        )[0]
+                        if kq < PE_DIM:
+                            c = ld_bf16(_rsrc(rope_cos), pos * (PE_DIM // 2) + kq // 2)
+                            sn = ld_bf16(_rsrc(rope_sin), pos * (PE_DIM // 2) + kq // 2)
+                            q0, q1 = q0 * c - q1 * sn, q0 * sn + q1 * c
+                        q0, q1 = fwht128(q0, q1)
+                        lds_st(xs, q_pair, bf16_pair(q0, q1))
+                    init = []
+                    for i in range_constexpr(SCORE_DEPTH):
+                        init += score_fetch(
+                            blocks[i],
+                            pos,
+                            wave_key0 + i * SCORE_STRIDE,
+                            fx.Int32(i) < count,
+                            kofs,
+                        )
+                    init += blocks[SCORE_DEPTH:]
+                    lds_barrier()
+                    # the row's rotated query (A operands of both head halves) and
+                    # head weights, held for all of this wave's groups
+                    qf = [
+                        [
+                            load_index_q8(
+                                hg * 16 + lane % 16, k32 * 32 + (lane // 16) * 8
+                            )
+                            for k32 in range(INDEX_DIM // 32)
+                        ]
+                        for hg in range(2)
+                    ]
+                    wf = [
+                        [
+                            lds_ld(keys, hg * 16 + (lane // 16) * 4 + e).bitcast(
+                                fx.Float32
+                            )
+                            for e in range(4)
+                        ]
+                        for hg in range(2)
+                    ]
+                    if count > 0:
+                        score_walk(s, row, init, qf, wf, kofs)
+                    lds_barrier()
+
+            for s in range_constexpr(S):
+                score_row(s)
 
             def select_digit(shift, prefix, remain):
                 digit = 255 - fx.min(tid, 255)
