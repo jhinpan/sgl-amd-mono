@@ -4,8 +4,9 @@ path, and requests join and leave a running batch that steps past 8 rows and bac
 (a short GSM8K run, for gross failures); the tokens of covered steps scored again by
 the normal prefill path (KL consistency); with MTP, verify steps of 1 and 2 requests
 (4 and 8 rows) on the kernels (GSM8K and the draft's accept length); each covered
-layer against the normal one, in decode and verify steps; and a fault on one rank
-that stops the server before any token of the failed step is sent."""
+layer against the normal one, in decode and verify steps, and in verify steps on the
+E4M3 MLA cache; and a fault on one rank that stops the server before any token of
+the failed step is sent."""
 
 import os
 import re
@@ -142,6 +143,16 @@ class TestMonokernelCheck(CustomTestCase):
         # check poisons the cached scales of this step's keys, so a launch that reads
         # a row's earlier drafts from the cache misses some of them (layer.topk_own)
         self._check_layers(MTP, ((1, 200), (2, 200)), new_tokens=16, rows=(4, 8))
+
+    def test_each_covered_verify_layer_within_its_numerics_with_fp8_kv(self):
+        # The E4M3 MLA cache (SGLang's HIP DSA rows: 576 values, no scales): the
+        # launches write the rows SGLang writes and attend the values it reads back
+        self._check_layers(
+            [*MTP, "--kv-cache-dtype", "fp8_e4m3"],
+            ((1, 200), (2, 200)),
+            new_tokens=16,
+            rows=(4, 8),
+        )
 
     def test_each_covered_layer_past_the_parallel_top_k(self):
         # rows of about 108k keys (27 chunks: 14 slices, 13 of two chunks) at widths 2
