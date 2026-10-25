@@ -322,7 +322,7 @@ def build_glm5_monokernel(
     SEL_BINS = 4096
     SEL_CAP = (X_WORDS - SEL_BINS) // 2
     assert not index_paged or SEL_CAP >= 2048
-    # rows of more keys select on SEL_SLICES CTAs a row, in the upper half of the grid
+    # rows of more keys select on up to SEL_SLICES CTAs a row, in the grid's upper half
     SEL_SLICES = INDEX_SEL_SLICES
     SEL_PAR_KEYS = INDEX_SEL_PAR_CHUNKS * SEL_CHUNK
     assert not index_paged or (
@@ -2914,12 +2914,12 @@ def build_glm5_monokernel(
                     lds_st(keys, 273, b)
                 gpu.barrier()
 
-            # Parallel paged top-k for rows of more than SEL_PAR_KEYS keys: SEL_SLICES
-            # CTAs a row (G // 2 ..) each histogram a slice of contiguous chunks, the
-            # row's index_select CTA merges them and publishes the threshold bin, the
-            # slice CTAs then collect their winners and candidates in position order,
-            # and index_select concatenates them in slice order: the same lists as the
-            # one-CTA path, so the same selection.
+            # Parallel paged top-k for rows of more than SEL_PAR_KEYS keys: up to
+            # SEL_SLICES CTAs a row (G // 2 ..) each histogram a slice of contiguous
+            # chunks, the row's index_select CTA merges them and publishes the
+            # threshold bin, the slice CTAs then collect their winners and candidates in
+            # position order, and index_select concatenates them in slice order: the
+            # same lists as the one-CTA path, so the same selection.
             def row_items(chunk):
                 return [
                     chunk * SEL_CHUNK + tid * SEL_ITEMS + j
@@ -3002,6 +3002,10 @@ def build_glm5_monokernel(
                             ]
                         )
                     gpu.barrier()
+                    # the histograms are plain stores released before their ready pairs
+                    fx.memory_fence(
+                        ordering=fx.AtomicOrdering.Acquire, syncscope="agent"
+                    )
                     for b in range_constexpr(SEL_BINS // THREADS):
                         bin_ = tid + b * THREADS
                         total = fx.Int32(0)
@@ -3169,8 +3173,9 @@ def build_glm5_monokernel(
                             publish(j, lds_ld(red, j).bitcast(fx.Int32))
 
                 def candidates(level, prefix, remain, n_cand, collect=True):
-                    """Keys above the ``level`` bin go to red, the bin's keys to LDS; a
-                    parallel row's slices already put them there (``collect=False``)."""
+                    """Keys above the ``level`` bin go to red, the bin's keys to LDS;
+                    for a parallel row, index_select copied the slices' lists there
+                    (``collect=False``)."""
                     if const_expr(collect):
                         set_bases(fx.Int32(0), fx.Int32(0))
                         for chunk in range(fx.Int32(0), n_chunks, fx.Int32(1)):
@@ -3295,13 +3300,18 @@ def build_glm5_monokernel(
                         )
                     publish_all()
 
-                def overflow(p12, r12):
+                def overflow(p12, r12, polled=True):
                     """The threshold bin overflows LDS: its keys' next 12 bits, then
-                    candidates or a byte-wise radix over every key (this CTA)."""
+                    candidates or a byte-wise radix over every key (this CTA). A
+                    parallel row's CTA has not polled the row's scores
+                    (``polled=False``)."""
                     clear_hist()
                     for chunk in range(fx.Int32(0), n_chunks, fx.Int32(1)):
                         items = chunk_items(fx.Int32(chunk))
-                        item_keys = load_keys(items)
+                        if const_expr(polled):
+                            item_keys = load_keys(items)
+                        else:
+                            item_keys = poll_keys(items)
                         for j in range_constexpr(SEL_ITEMS):
                             k = item_keys[j]
                             if (items[j] < bound) & ((k >> 20) == (p12 >> 20)):
@@ -3350,6 +3360,10 @@ def build_glm5_monokernel(
                                 get(mb("index_gather_count"), s * SEL_SLICES + lane),
                             )
                         gpu.barrier()
+                        # the staged lists are plain stores released before their counts
+                        fx.memory_fence(
+                            ordering=fx.AtomicOrdering.Acquire, syncscope="agent"
+                        )
                         n_win, n_cand = fx.Int32(0), fx.Int32(0)
                         for kk in range_constexpr(SEL_SLICES):
                             v = (fx.Int32(kk) < n_sl).select(
@@ -3388,7 +3402,7 @@ def build_glm5_monokernel(
                             n_win, n_cand = n_win + w, n_cand + c
                         candidates(20, p12, r12, c12, collect=False)
                     if c12 > SEL_CAP:
-                        overflow(p12, r12)
+                        overflow(p12, r12, polled=False)
                 fx.memory_fence(ordering=fx.AtomicOrdering.Release, syncscope="agent")
                 gpu.barrier()
                 if tid == 0:

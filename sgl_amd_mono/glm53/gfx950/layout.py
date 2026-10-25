@@ -35,12 +35,12 @@ INDEX_DIM = 128
 INDEX_Q_ROWS = INDEX_HEADS * INDEX_DIM
 INDEX_TILE = 16
 INDEX_KEYS_PER_TASK = 64
-# a long row's paged top-k runs on this many slices (CTAs) per row, each with
+# a long row's paged top-k runs on up to this many slices (CTAs) per row, each with
 # staging room for this many threshold-bin candidates
 INDEX_SEL_SLICES = 16
 INDEX_CAND_STAGE_CAP = 16384
 # keys a select chunk (a CTA's 512 threads x 8), and the chunks past which a row selects
-# on INDEX_SEL_SLICES CTAs: up to 8 chunks the hand-offs cost what the slices save
+# on up to INDEX_SEL_SLICES CTAs: up to 8 chunks the hand-offs cost what the slices save
 INDEX_SEL_CHUNK = 4096
 INDEX_SEL_PAR_CHUNKS = 8
 

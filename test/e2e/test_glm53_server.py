@@ -28,6 +28,7 @@ from sglang.test.test_utils import (
 )
 
 from sgl_amd_mono import BACKEND
+from sgl_amd_mono.glm53.gfx950 import layout
 
 LAUNCH_TIMEOUT = 3600
 # The normal path scores about 0.97 on GSM8K (thinking on); the bound is for gross
@@ -143,14 +144,16 @@ class TestMonokernelCheck(CustomTestCase):
         self._check_layers(MTP, ((1, 200), (2, 200)), new_tokens=16, rows=(4, 8))
 
     def test_each_covered_layer_past_the_parallel_top_k(self):
-        # rows of about 36k keys (9 chunks, past the one-CTA path's 8) select their top-k
-        # on 9 CTAs each: 1, 3 and 8 such rows at widths 2, 4 and 8
+        # rows of about 108k keys (27 chunks: 14 slices, 13 of two chunks) at widths 2
+        # and 4, and of about 36k keys (9 one-chunk slices) at width 8
+        past = 65536
+        self.assertGreaterEqual(past, layout.INDEX_SEL_SLICES * layout.INDEX_SEL_CHUNK)
         self._check_layers(
             [],
-            ((1, 3000), (3, 3000), (8, 3000)),
+            ((1, 9000), (3, 9000), (8, 3000)),
             new_tokens=4,
             rows=(1, 3, 8),
-            past=32768,
+            past=past,
         )
 
     def _check_layers(self, extra_args, batches, new_tokens, rows, past=2048):
@@ -207,6 +210,7 @@ class TestMonokernelCheck(CustomTestCase):
         seen = {(kind, int(n)) for kind, n, _, _ in checks}
         want = {(kind, n) for kind in ("indexer", "shared") for n in rows}
         self.assertTrue(want <= seen, seen)
+        self.assertIn("layer.topk_exact.max_abs", values)
         self.assertTrue(
             any(k == "indexer" and int(hi) >= past for k, _, hi, _ in checks)
         )
