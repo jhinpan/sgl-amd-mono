@@ -145,8 +145,9 @@ class TestMonokernelCheck(CustomTestCase):
 
     def test_each_covered_layer_past_the_parallel_top_k(self):
         # rows of about 108k keys (27 chunks: 14 slices, 13 of two chunks) at widths 2
-        # and 4, and of about 36k keys (9 one-chunk slices) at width 8
-        past = 65536
+        # and 4, and of about 36k keys (9 one-chunk slices) at width 8. Past 98304
+        # keys each wave's score walk refills its buffers and looks blocks ahead.
+        past = 98304
         self.assertGreaterEqual(past, layout.INDEX_SEL_SLICES * layout.INDEX_SEL_CHUNK)
         self._check_layers(
             [],

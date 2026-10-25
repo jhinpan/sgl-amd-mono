@@ -2673,7 +2673,9 @@ def build_glm5_monokernel(
             SCORE_DEPTH = 2
             SCORE_STRIDE = 2 * G * INDEX_KEYS_PER_TASK
             SCORE_BUF = 6  # a group in flight: 4 word pairs, its scale and block
-            assert S <= 16  # a row's last S keys reach one group of a wave at most
+            # a wave's groups are SCORE_STRIDE keys apart: a row's last S keys reach one
+            # group of a wave at most
+            assert S + 15 < SCORE_STRIDE
 
             def lds_barrier():
                 """A barrier for an LDS hand-off only: gpu.barrier would also wait on
