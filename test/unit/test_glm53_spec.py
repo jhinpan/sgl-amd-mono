@@ -181,12 +181,12 @@ def test_an_fp8_launch_binds_only_the_raw_e4m3_mla_cache(dtype, row, bound):
         return_value=pool,
     ):
         if bound:
-            glm53._Built._bind(layer, torch.float8_e4m3fn)
+            glm53._Built._bind(layer, kv_dtype=torch.float8_e4m3fn)
             assert layer.caches.kv.dtype == torch.float8_e4m3fn
             assert layer.caches.kv.shape == (130, 576)
         else:
             with pytest.raises(RuntimeError, match="MLA cache"):
-                glm53._Built._bind(layer, torch.float8_e4m3fn)
+                glm53._Built._bind(layer, kv_dtype=torch.float8_e4m3fn)
 
 
 @pytest.mark.parametrize(

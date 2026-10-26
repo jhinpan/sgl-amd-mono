@@ -390,9 +390,7 @@ class _Built:
                 self._take_topk(topk_indices, step, S, W)
         else:
             h = hidden
-        from sgl_amd_mono.glm53.gfx950.runner import kv_cache_dtype
-
-        self._bind(L, kv_cache_dtype(L.ops[W].rt.key))
+        self._bind(L, kv_dtype=L.ops[W].rt.kv_dtype)
         checking = self.check_layers and not torch.cuda.is_current_stream_capturing()
         if checking:
             from sgl_amd_mono.glm53 import check

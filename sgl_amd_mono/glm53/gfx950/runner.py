@@ -151,6 +151,7 @@ class Glm53Runtime:
 
         ensure_writable_flydsl_cache()
         self.key, self.width, self.rank = key, key.rows, rank
+        self.kv_dtype = torch.float8_e4m3fn if key.kv_fp8 else torch.bfloat16
         self.sc, self.sy = layout(
             key.rows,
             key.heads,
@@ -214,11 +215,6 @@ class Glm53Runtime:
         self.peer.close()
 
 
-def kv_cache_dtype(key: Glm53Build) -> torch.dtype:
-    """The MLA cache dtype a launch reads and writes."""
-    return torch.float8_e4m3fn if key.kv_fp8 else torch.bfloat16
-
-
 def _check(name: str, t: torch.Tensor, shape: tuple, dtype: torch.dtype) -> None:
     if tuple(t.shape) != shape or t.dtype != dtype or not t.is_contiguous():
         raise ValueError(
@@ -263,9 +259,8 @@ class Glm53LayerOp:
         if pt.dtype != torch.int32 or pt.dim() != 2 or pt.stride(1) != 1:
             raise ValueError("needs an int32 page table with contiguous rows")
         kv, idx = caches.kv, caches.idx
-        kv_dtype = kv_cache_dtype(rt.key)
-        if kv.dtype != kv_dtype or kv.dim() != 2 or kv.stride() != (KV_ROW, 1):
-            raise ValueError(f"needs the MLA cache as {kv_dtype} [slots, {KV_ROW}]")
+        if kv.dtype != rt.kv_dtype or kv.dim() != 2 or kv.stride() != (KV_ROW, 1):
+            raise ValueError(f"needs the MLA cache as {rt.kv_dtype} [slots, {KV_ROW}]")
         if rt.key.with_indexer and (
             idx is None
             or idx.dtype != torch.uint8
