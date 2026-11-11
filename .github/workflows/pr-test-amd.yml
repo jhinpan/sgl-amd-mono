@@ -107,6 +107,7 @@ jobs:
           ref: ${{ steps.pr.outputs.pr_sha }}
           path: pr
           persist-credentials: false
+          allow-unsafe-pr-checkout: true
 
       - name: Scope
         id: scope
